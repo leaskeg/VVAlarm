@@ -1,0 +1,26 @@
+# Python related
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.env/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# Cache
+*.cache
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+
+# OS generated
+.DS_Store
+Thumbs.db
