@@ -311,11 +311,10 @@ class ClashCommands(commands.Cog):
         await interaction.response.send_autocomplete(matching_clans[:25])
 
     @nextcord.slash_command(
-        name="match_status",
-        description="Tjek den nuværende krigsstatus (Kun for administratorer)",
-        default_member_permissions=nextcord.Permissions(administrator=True),
+        name="match_status", description="Tjek status for klanens krig."
     )
     async def match_status(self, interaction: nextcord.Interaction, clan: str):
+        await interaction.response.defer()  # Defer the response to allow follow-up messages
         clan_tag = None
         for tag, info in clan_channels.items():
             if info["name"] == clan:
@@ -323,15 +322,16 @@ class ClashCommands(commands.Cog):
                 break
 
         if not clan_tag:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Klanen {clan} blev ikke fundet.", ephemeral=True
             )
             return
 
         war_data = make_coc_request(f"clans/{clan_tag.replace('#', '%23')}/currentwar")
         if not war_data:
-            await interaction.response.send_message(
-                f"Kunne ikke hente data for klan {clan} ({clan_tag}).", ephemeral=True
+            await interaction.followup.send(
+                f"Kunne ikke hente data for klan {clan} ({clan_tag}).",
+                ephemeral=True,
             )
             return
 
@@ -370,7 +370,7 @@ class ClashCommands(commands.Cog):
             war_end_time_str = war_data.get("endTime")
             time_until_start = calculate_time_until_war_end(war_end_time_str)
             time_until_start_formatted = f"{time_until_start.seconds // 3600} timer, {(time_until_start.seconds // 60) % 60} minutter"
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Klan {clan} ({clan_tag}) er i forberedelsesfasen. Krigen starter om: {time_until_start_formatted}."
             )
 
@@ -404,7 +404,7 @@ class ClashCommands(commands.Cog):
                 await interaction.followup.send(msg)
 
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Klan {clan} ({clan_tag}) er i en ukendt tilstand: {state}",
                 ephemeral=True,
             )
@@ -416,7 +416,6 @@ class ClashCommands(commands.Cog):
             for tag, info in clan_channels.items()
             if query.lower() in info["name"].lower()
         ]
-
         await interaction.response.send_autocomplete(matching_clans[:25])
 
     @nextcord.slash_command(
@@ -494,50 +493,44 @@ async def reminder_check():
         time_until_end = calculate_time_until_war_end(war_end_time_str)
         logging.info(f"Time until war ends for clan {clan_tag}: {time_until_end}")
 
-        message = ""
-        if timedelta(hours=1) >= time_until_end > timedelta(minutes=59):
-            logging.info(f"Triggering 1-hour reminder for clan {clan_tag}")
-            message = "⏰ Der er 1 time tilbage af krigen! Husk at angribe."
-        elif timedelta(minutes=30) >= time_until_end > timedelta(minutes=29):
-            logging.info(f"Triggering 30-minute reminder for clan {clan_tag}")
-            message = "⏰ Der er 30 minutter tilbage af krigen! Skynd dig at angribe."
-        elif timedelta(minutes=15) >= time_until_end > timedelta(minutes=14):
-            logging.info(f"Triggering 15-minute reminder for clan {clan_tag}")
-            message = "⚠️ Der er kun 15 minutter tilbage af krigen! Angrib nu!"
-        else:
-            logging.info(f"No reminder needed for clan {clan_tag}")
-            continue
+        reminder_time_messages = {
+            "1_hour": "⏰ Der er 1 time tilbage af krigen! Husk at angribe! ⏰",
+            "30_min": "⏰ Der er 30 minutter tilbage af krigen! Angrib, IDAG TAK! ⏰",
+            "15_min": "⚠️ Så er der 15 minutter tilbage af krigen! Angrib nu dit fedtnæb! ⚠️",
+        }
 
-        unattacked_players = get_unattacked_players(war_data)
-        channel = bot.get_channel(channel_data["channel"])
-        if channel:
-            try:
-                for player_tag, missing_attacks in unattacked_players.items():
-                    discord_mentions = [
-                        f"<@{user_id}>"
-                        for user_id, tags in linked_accounts.items()
-                        if player_tag in tags
-                    ]
-                    linked_users = (
-                        ", ".join(discord_mentions)
-                        if discord_mentions
-                        else "Ingen Discord-link"
-                    )
+        reminder_triggered = None
+        if timedelta(hours=1) >= time_until_end > timedelta(minutes=59):
+            reminder_triggered = "1_hour"
+        elif timedelta(minutes=30) >= time_until_end > timedelta(minutes=29):
+            reminder_triggered = "30_min"
+        elif timedelta(minutes=15) >= time_until_end > timedelta(minutes=14):
+            reminder_triggered = "15_min"
+
+        if reminder_triggered:
+            message = reminder_time_messages[reminder_triggered]
+            clan_name = channel_data.get(
+                "name", "Ukendt Klan"
+            )  # Fallback if name is missing
+            unattacked_players = get_unattacked_players(war_data)
+            channel = bot.get_channel(channel_data["channel"])
+            if channel:
+                player_list = "\n".join(
+                    f"- {player_tag}: Mangler {missing_attacks} angreb. "
+                    f"Linket: {', '.join([f'<@{user_id}>' for user_id, tags in linked_accounts.items() if player_tag in tags]) or 'Ingen Discord-link'}"
+                    for player_tag, missing_attacks in unattacked_players.items()
+                )
+                try:
                     await channel.send(
-                        f"⚠️ Påmindelse om krig for {clan_tag}\n{message}\n\n"
-                        f"Spiller: {player_tag} mangler {missing_attacks} angreb. Linket: {linked_users}"
+                        f"⚠️ Påmindelse om krig for klan {clan_name} ({clan_tag}) ⚠️\n{message}\n\nSpillere der mangler at angribe:\n{player_list}"
                     )
-                logging.info(
-                    f"Sent reminder for clan {clan_tag} to channel {channel_data['channel']}"
-                )
-            except Exception as e:
-                logging.error(
-                    f"Failed to send message to channel {channel_data['channel']} for clan {clan_tag}: {e}"
-                )
-        else:
-            logging.error(
-                f"Failed to find channel {channel_data['channel']} for clan {clan_tag}"
-            )
+                    logging.info(
+                        f"Sent reminder for clan {clan_name} ({clan_tag}) to channel {channel_data['channel']}"
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"Failed to send message to channel {channel_data['channel']} for clan {clan_tag}: {e}"
+                    )
 
 
 @tasks.loop(minutes=1)
