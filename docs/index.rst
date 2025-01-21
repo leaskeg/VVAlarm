@@ -6,12 +6,16 @@
 VVAlarm documentation
 =====================
 
-Add your content using ``reStructuredText`` syntax. See the
-`reStructuredText <https://www.sphinx-doc.org/en/master/usage/restructuredtext/index.html>`_
-documentation for details.
-
+VV-Alarm is a dedicated Discord bot for Clash of Clans. It helps manage wars, sends timely reminders, and keeps your clan on track. With VV-Alarm, you’ll never miss an attack again!
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
+
+   introduction
+   setup
+   commands
+   faq
+
+
 
