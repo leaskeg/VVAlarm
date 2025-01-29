@@ -89,6 +89,11 @@ def make_coc_request(endpoint, retries=3):
         try:
             logging.info(f"Making API request to: {url}")
             response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 404:
+                logging.warning(
+                    f"404 Not Found: {url}. Likely CWL hasn't started or clan not registered."
+                )
+                return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -129,6 +134,11 @@ def get_unattacked_players(war_data):
         for member in war_data.get("clan", {}).get("members", [])
         if len(member.get("attacks", [])) < 2
     }
+
+
+def get_league_group_data(clan_tag):
+    endpoint = f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
+    return make_coc_request(endpoint)
 
 
 # Bot setup
@@ -495,137 +505,287 @@ bot.add_cog(ClashCommands(bot))
 @tasks.loop(minutes=1)
 async def reminder_check():
     for clan_tag, channel_data in clan_channels.items():
-        logging.info(f"Checking reminder for clan: {clan_tag}")
+        logging.info(f"Checking reminders for clan: {clan_tag}")
 
+        # Check normal war reminders
         war_data = make_coc_request(f"clans/{clan_tag.replace('#', '%23')}/currentwar")
-        if not war_data:
-            logging.warning(f"No war data for clan: {clan_tag}")
-            continue
+        if war_data and war_data.get("state") == "inWar":
+            await process_normal_war_reminders(clan_tag, war_data, channel_data)
 
-        if war_data.get("state") != "inWar":
-            logging.info(f"Clan {clan_tag} is not in war state.")
-            continue
+        # Check CWL reminders
+        league_data = make_coc_request(
+            f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
+        )
+        if league_data and "rounds" in league_data:
+            await process_cwl_reminders(clan_tag, league_data, channel_data)
 
-        war_end_time_str = war_data.get("endTime")
-        time_until_end = calculate_time_until_war_end(war_end_time_str, "inWar")
-        logging.info(f"Time until war ends for clan {clan_tag}: {time_until_end}")
 
-        reminder_time_messages = {
-            "1_hour": "⏰ Der er 1 time tilbage af krigen! Husk at angribe! ⏰",
-            "30_min": "⏰ Der er 30 minutter tilbage af krigen! Angrib, IDAG TAK! ⏰",
-            "15_min": "⚠️ Så er der 15 minutter tilbage af krigen! Angrib nu dit fedtnæb! ⚠️",
-        }
+async def process_normal_war_reminders(clan_tag, war_data, channel_data):
+    """Process reminders for normal wars."""
+    war_end_time_str = war_data.get("endTime")
+    time_until_end = calculate_time_until_war_end(war_end_time_str, "inWar")
+    logging.info(f"Normal war time until end for clan {clan_tag}: {time_until_end}")
 
-        reminder_triggered = None
-        if timedelta(hours=1) >= time_until_end > timedelta(minutes=59):
-            reminder_triggered = "1_hour"
-        elif timedelta(minutes=30) >= time_until_end > timedelta(minutes=29):
-            reminder_triggered = "30_min"
-        elif timedelta(minutes=15) >= time_until_end > timedelta(minutes=14):
-            reminder_triggered = "15_min"
+    # Reminder messages and logic
+    reminder_time_messages = {
+        "1_hour": "⏰ Der er 1 time tilbage af krigen! Husk at angribe! ⏰",
+        "30_min": "⏰ Der er 30 minutter tilbage af krigen! Angrib, I DAG TAK! ⏰",
+        "15_min": "⚠️ Så er der 15 minutter tilbage af krigen! Angrib nu dit fedtnæb! ⚠️",
+    }
 
-        if reminder_triggered:
-            message = reminder_time_messages[reminder_triggered]
-            clan_name = channel_data.get(
-                "name", "Ukendt Klan"
-            )  # Fallback if name is missing
-            unattacked_players = get_unattacked_players(war_data)
-            channel = bot.get_channel(channel_data["channel"])
+    reminder_triggered = None
+    if timedelta(hours=1) >= time_until_end > timedelta(minutes=59):
+        reminder_triggered = "1_hour"
+    elif timedelta(minutes=30) >= time_until_end > timedelta(minutes=29):
+        reminder_triggered = "30_min"
+    elif timedelta(minutes=15) >= time_until_end > timedelta(minutes=14):
+        reminder_triggered = "15_min"
+
+    if reminder_triggered:
+        clan_name = channel_data.get("name", "Ukendt Klan")
+        channel = bot.get_channel(channel_data["channel"])
+        unattacked_players = get_unattacked_players(war_data)
+
+        if not unattacked_players:
+            # If all players have attacked, send the congratulatory message
+            message = "Alle spillere har angrebet! Stærkt! 🎉💪"
             if channel:
-                player_list = "\n".join(
-                    f"- {player_tag}: Mangler {missing_attacks} angreb. "
-                    f"Linket: {', '.join([f'<@{user_id}>' for user_id, tags in linked_accounts.items() if player_tag in tags]) or 'Ingen Discord-link'}"
-                    for player_tag, missing_attacks in unattacked_players.items()
-                )
                 try:
                     await channel.send(
-                        f"⚠️ Påmindelse om krig for klan {clan_name} ({clan_tag}) ⚠️\n{message}\n\nSpillere der mangler at angribe:\n{player_list}"
+                        f"⚔️ Normal krig for klan {clan_name} ({clan_tag}) ⚔️\n{message}"
                     )
                     logging.info(
-                        f"Sent reminder for clan {clan_name} ({clan_tag}) to channel {channel_data['channel']}"
+                        f"Sent 'all players attacked' message for clan {clan_name} ({clan_tag}) to channel {channel_data['channel']}"
                     )
                 except Exception as e:
                     logging.error(
-                        f"Failed to send message to channel {channel_data['channel']} for clan {clan_tag}: {e}"
+                        f"Failed to send 'all players attacked' message to channel {channel_data['channel']} for clan {clan_tag}: {e}"
                     )
+        else:
+            # Send the reminder with the list of unattacked players
+            message = reminder_time_messages[reminder_triggered]
+            player_list = "\n".join(
+                f"- {player_tag}: Mangler {missing_attacks} angreb. "
+                f"Linket: {', '.join([f'<@{user_id}>' for user_id, tags in linked_accounts.items() if player_tag in tags]) or 'Ingen Discord-link'}"
+                for player_tag, missing_attacks in unattacked_players.items()
+            )
+            if channel:
+                try:
+                    await channel.send(
+                        f"⚠️ Påmindelse om normal krig for klan {clan_name} ({clan_tag}) ⚠️\n{message}\n\nSpillere der mangler at angribe:\n{player_list}"
+                    )
+                    logging.info(
+                        f"Sent reminder for normal war for clan {clan_name} ({clan_tag}) to channel {channel_data['channel']}"
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"Failed to send normal war reminder to channel {channel_data['channel']} for clan {clan_tag}: {e}"
+                    )
+
+
+async def process_cwl_reminders(clan_tag, league_data, channel_data):
+    """Process reminders for CWL wars."""
+    if not league_data or "rounds" not in league_data:
+        logging.info(
+            f"No CWL data available for clan {clan_tag}. Skipping CWL reminders."
+        )
+        return
+
+    for round_data in league_data["rounds"]:
+        for war in round_data.get("wars", []):
+            if war.get("state") != "inWar":
+                continue
+
+            war_end_time_str = war.get("endTime")
+            time_until_end = calculate_time_until_war_end(war_end_time_str, "inWar")
+            logging.info(
+                f"CWL war time until end for clan {clan_tag}: {time_until_end}"
+            )
+
+            # Reminder messages and logic
+            reminder_time_messages = {
+                "1_hour": "⏰ CWL: Der er 1 time tilbage af krigen! Husk at angribe! ⏰",
+                "30_min": "⏰ CWL: Der er 30 minutter tilbage af krigen! Angrib nu! ⏰",
+                "15_min": "⚠️ CWL: Der er 15 minutter tilbage af krigen! ⚠️",
+            }
+
+            reminder_triggered = None
+            if timedelta(hours=1) >= time_until_end > timedelta(minutes=59):
+                reminder_triggered = "1_hour"
+            elif timedelta(minutes=30) >= time_until_end > timedelta(minutes=29):
+                reminder_triggered = "30_min"
+            elif timedelta(minutes=15) >= time_until_end > timedelta(minutes=14):
+                reminder_triggered = "15_min"
+
+            if reminder_triggered:
+                message = reminder_time_messages[reminder_triggered]
+                clan_name = channel_data.get("name", "Ukendt Klan")
+                unattacked_players = get_unattacked_players(war)
+                channel = bot.get_channel(channel_data["channel"])
+                if channel:
+                    player_list = "\n".join(
+                        f"- {player_tag}: Mangler {missing_attacks} angreb. "
+                        f"Linket: {', '.join([f'<@{user_id}>' for user_id, tags in linked_accounts.items() if player_tag in tags]) or 'Ingen Discord-link'}"
+                        for player_tag, missing_attacks in unattacked_players.items()
+                    )
+                    try:
+                        await channel.send(
+                            f"⚠️ Påmindelse om CWL krig for klan {clan_name} ({clan_tag}) ⚠️\n{message}\n\nSpillere der mangler at angribe:\n{player_list}"
+                        )
+                        logging.info(
+                            f"Sent reminder for CWL war for clan {clan_name} ({clan_tag}) to channel {channel_data['channel']}"
+                        )
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to send CWL war reminder to channel {channel_data['channel']} for clan {clan_tag}: {e}"
+                        )
+
+
+def ensure_war_data_exists(clan_tag, war_id):
+    """Ensure the structure for a given war ID exists in prep_notifications."""
+    global prep_notifications
+    if clan_tag not in prep_notifications:
+        prep_notifications[clan_tag] = {"channel": None, "notifiers": [], "wars": {}}
+    if "wars" not in prep_notifications[clan_tag]:
+        prep_notifications[clan_tag]["wars"] = {}
+    if war_id not in prep_notifications[clan_tag]["wars"]:
+        prep_notifications[clan_tag]["wars"][war_id] = {"1_hour_reminder_sent": False}
 
 
 @tasks.loop(minutes=1)
 async def prep_notification_check():
+    global prep_notifications
+
     for clan_tag, prep_data in prep_notifications.items():
-        logging.info(f"Checking preparation status for clan: {clan_tag}")
+        logging.info(f"Checking preparation notifications for clan: {clan_tag}")
+
+        # Check current war status
         war_data = make_coc_request(f"clans/{clan_tag.replace('#', '%23')}/currentwar")
-        if not war_data:
-            logging.warning(f"No war data for clan: {clan_tag}")
-            continue
+        if war_data:
+            war_state = war_data.get("state")
 
-        state = war_data.get("state")
-        logging.info(f"Clan {clan_tag} state: {state}")
-        if state != "preparation":
-            logging.info(f"Clan {clan_tag} is not in preparation state.")
-            continue
-
-        war_end_time_str = war_data.get("endTime")
-        time_until_start = calculate_time_until_war_end(war_end_time_str, state)
-        logging.info(
-            f"Time until preparation ends for clan {clan_tag}: {time_until_start}"
-        )
-
-        # Debug reminder condition
-        reminder_condition = (
-            timedelta(hours=1, minutes=5) >= time_until_start > timedelta(minutes=45)
-        )
-        logging.info(f"Reminder condition for clan {clan_tag}: {reminder_condition}")
-
-        # Check the reminder flag
-        reminder_sent = prep_data.get("1_hour_reminder_sent", False)
-        logging.info(
-            f"'1_hour_reminder_sent' flag for clan {clan_tag}: {reminder_sent}"
-        )
-
-        if reminder_condition:
-            if reminder_sent:
+            # Reset notifications if the clan is now in the "inWar" state
+            if war_state == "inWar":
                 logging.info(
-                    f"1-hour reminder already sent for clan: {clan_tag}. Skipping reminder."
+                    f"Clan {clan_tag} is now in war. Resetting prep notifications."
                 )
+                prep_data["wars"] = {}
                 continue
 
-            prep_channel_id = prep_data.get("channel", prep_channel)
-            notifiers = prep_data.get("notifiers", [])
-            logging.info(
-                f"Prep channel for clan {clan_tag}: {prep_channel_id}, Notifiers: {notifiers}"
-            )
+            # Process normal war preparation if still in the "preparation" state
+            if war_state == "preparation":
+                await process_normal_war_prep(clan_tag, war_data, prep_data)
 
-            if not prep_channel_id or not notifiers:
-                logging.warning(
-                    f"Missing prep channel or notifiers for clan: {clan_tag}"
-                )
-                continue
+        # Check CWL preparation (if applicable)
+        league_data = make_coc_request(
+            f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
+        )
+        if league_data and "rounds" in league_data:
+            await process_cwl_prep(clan_tag, league_data, prep_data)
 
+    # Save any updates to the JSON file
+    save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+
+
+async def process_normal_war_prep(clan_tag, war_data, prep_data):
+    """Process preparation notifications for normal wars."""
+    war_end_time_str = war_data.get("endTime")
+    war_id = f"{war_end_time_str}"  # Use only the endTime as unique war ID
+
+    # Ensure the structure exists for the war
+    ensure_war_data_exists(clan_tag, war_id)
+
+    # Calculate time until the start of the war
+    time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
+    logging.info(f"Normal war time until start for clan {clan_tag}: {time_until_start}")
+
+    # Check if the reminder has already been sent
+    reminder_sent = prep_data["wars"][war_id].get("1_hour_reminder_sent", False)
+    if (
+        timedelta(hours=1, minutes=5) >= time_until_start > timedelta(minutes=25)
+        and not reminder_sent
+    ):
+        prep_channel_id = prep_data.get("channel", prep_channel)
+        notifiers = prep_data.get("notifiers", [])
+
+        if prep_channel_id and notifiers:
             channel = bot.get_channel(prep_channel_id)
             notifier_mentions = ", ".join([f"<@{user_id}>" for user_id in notifiers])
 
             if channel:
-                clan_name = clan_channels.get(clan_tag, {}).get(
-                    "name", "Unknown Clan"
-                )  # Fetch the clan name
                 try:
                     await channel.send(
-                        f"⚠️ Forberedelses-påmindelse for klan {clan_name} ({clan_tag}):\n"
+                        f"⚠️ Forberedelses-påmindelse for klan {clan_tag}:\n"
                         f"{notifier_mentions}, der er mindre end 1 time tilbage før krigen starter!"
                     )
-                    logging.info(
-                        f"Sent preparation reminder for clan {clan_name} ({clan_tag}) to channel {prep_channel_id}."
-                    )
-                    prep_data["1_hour_reminder_sent"] = True
-                    prep_notifications[clan_tag] = prep_data
+                    logging.info(f"Sent normal preparation reminder for war {war_id}.")
+
+                    # Update the flag to indicate the reminder has been sent
+                    prep_notifications[clan_tag]["wars"][war_id][
+                        "1_hour_reminder_sent"
+                    ] = True
+
+                    # Save the updated prep_notifications to the file
                     save_data(PREP_NOTIFICATION_FILE, prep_notifications)
                 except Exception as e:
                     logging.error(
-                        f"Failed to send message to channel {prep_channel_id} for clan {clan_tag}: {e}"
+                        f"Failed to send normal prep reminder for war {war_id}: {e}"
                     )
-            else:
-                logging.warning(f"Channel {prep_channel_id} not found.")
+
+
+async def process_cwl_prep(clan_tag, league_data, prep_data):
+    """Process preparation notifications for CWL wars."""
+    for round_data in league_data.get("rounds", []):
+        for war in round_data.get("wars", []):
+            if war.get("state") != "preparation":
+                continue
+
+            war_end_time_str = war.get("endTime")
+            war_id = f"{clan_tag}_{war_end_time_str}"  # Unique identifier for CWL war
+
+            time_until_start = calculate_time_until_war_end(
+                war_end_time_str, "preparation"
+            )
+            logging.info(
+                f"CWL preparation time for war {war_id} in clan {clan_tag}: {time_until_start}"
+            )
+
+            # Ensure the war_id exists in prep_data
+            if war_id not in prep_data:
+                prep_data[war_id] = {"1_hour_reminder_sent": False}
+
+            # Check if the reminder has already been sent
+            reminder_sent = prep_data[war_id].get("1_hour_reminder_sent", False)
+            if (
+                timedelta(hours=1, minutes=5)
+                >= time_until_start
+                > timedelta(minutes=45)
+                and not reminder_sent
+            ):
+                prep_channel_id = prep_data.get("channel", prep_channel)
+                notifiers = prep_data.get("notifiers", [])
+
+                if prep_channel_id and notifiers:
+                    channel = bot.get_channel(prep_channel_id)
+                    notifier_mentions = ", ".join(
+                        [f"<@{user_id}>" for user_id in notifiers]
+                    )
+
+                    if channel:
+                        try:
+                            await channel.send(
+                                f"⚠️ CWL Forberedelses-påmindelse for klan {clan_tag}:\n"
+                                f"{notifier_mentions}, der er mindre end 1 time tilbage før CWL krigen starter!"
+                            )
+                            logging.info(
+                                f"Sent CWL preparation reminder for war {war_id}."
+                            )
+                            prep_data[war_id]["1_hour_reminder_sent"] = True
+                            save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+                        except Exception as e:
+                            logging.error(
+                                f"Failed to send CWL prep reminder for war {war_id}: {e}"
+                            )
 
 
 @bot.event
