@@ -395,7 +395,7 @@ class ClashCommands(commands.Cog):
 
         elif state == "preparation":
             war_end_time_str = war_data.get("endTime")
-            time_until_start = calculate_time_until_war_end(war_end_time_str)
+            time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
             time_until_start_formatted = f"{time_until_start.seconds // 3600} timer, {(time_until_start.seconds // 60) % 60} minutter"
             await interaction.followup.send(
                 f"Klan {clan} ({clan_tag}) er i forberedelsesfasen. Krigen starter om: {time_until_start_formatted}."
@@ -699,6 +699,7 @@ async def process_normal_war_prep(clan_tag, war_data, prep_data):
     time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
     logging.info(f"Normal war time until start for clan {clan_tag}: {time_until_start}")
 
+    clan_name = prep_data.get("name", "Ukendt Klan")
     # Check if the reminder has already been sent
     reminder_sent = prep_data["wars"][war_id].get("1_hour_reminder_sent", False)
     if (
@@ -715,7 +716,7 @@ async def process_normal_war_prep(clan_tag, war_data, prep_data):
             if channel:
                 try:
                     await channel.send(
-                        f"⚠️ Forberedelses-påmindelse for klan {clan_tag}:\n"
+                        f"⚠️ Forberedelses-påmindelse for klan {clan_name} {clan_tag}:\n"
                         f"{notifier_mentions}, der er mindre end 1 time tilbage før krigen starter!"
                     )
                     logging.info(f"Sent normal preparation reminder for war {war_id}.")
