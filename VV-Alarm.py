@@ -1112,8 +1112,9 @@ async def process_normal_war_prep(clan_tag, war_data, prep_data):
     time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
     logging.info(f"Normal war time until start for clan {clan_tag}: {time_until_start}")
 
-    clan_name = prep_data.get("name", "Ukendt Klan")
+    clan_name = war_data.get("clan", {}).get("name", "Ukendt Klan")
     reminder_sent = prep_data["wars"][war_id].get("1_hour_reminder_sent", False)
+    logging.info(f"Normal war reminder sent: {reminder_sent}")
     if (
         timedelta(hours=1, minutes=5) >= time_until_start > timedelta(minutes=25)
         and not reminder_sent
