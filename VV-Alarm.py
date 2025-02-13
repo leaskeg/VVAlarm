@@ -1130,7 +1130,7 @@ async def process_normal_war_prep(clan_tag, war_data, prep_data):
                 try:
                     await channel.send(
                         f"⚠️ Forberedelses-påmindelse for klan {clan_name} {clan_tag}:\n"
-                        f"{notifier_mentions}, der er mindre end 1 time tilbage før krigen starter!"
+                        f"{notifier_mentions}, der er mindre end 1 time tilbage før krigen starter!!"
                     )
                     logging.info(f"Sent normal preparation reminder for war {war_id}.")
 
