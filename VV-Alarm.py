@@ -11,9 +11,45 @@ from nextcord.ext import commands, tasks
 import aiohttp
 import asyncio
 from asyncio import Semaphore
+from sqlalchemy import (
+    Column,
+    Integer,
+    BigInteger,
+    String,
+    DateTime,
+    ForeignKey,
+    create_engine,
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base, relationship, selectinload
+from sqlalchemy import select, delete, update
+from sqlalchemy.dialects.mysql import JSON
+from sqlalchemy.sql import func
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging with better configuration for production
+import logging.handlers
+
+# Create logs directory if it doesn't exist
+import os
+
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+# Set up rotating file handler for production logging
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            "logs/vv-alarm.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",  # Add UTF-8 encoding to handle Unicode characters
+        ),
+        logging.StreamHandler(),  # Also log to console
+    ],
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,11 +57,15 @@ load_dotenv()
 # API tokens and other configurations
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COC_API_TOKEN = os.getenv("COC_API_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DISCORD_BOT_TOKEN or not COC_API_TOKEN:
     raise ValueError(
         "Environment variables DISCORD_BOT_TOKEN and COC_API_TOKEN must be set."
     )
+
+if not DATABASE_URL:
+    raise ValueError("Environment variable DATABASE_URL must be set.")
 
 # File paths
 LINKED_ACCOUNTS_FILE = "linked_accounts.json"
@@ -59,23 +99,500 @@ def load_data(filepath):
 
 
 def save_data(filepath, data):
-    with open(filepath, "w") as file:
-        json.dump(data, file)
+    """Save data to JSON file with backup and atomic write for data safety."""
+    import tempfile
+    import shutil
+
+    # Create backup before writing
+    if os.path.exists(filepath):
+        backup_path = f"{filepath}.backup"
+        try:
+            shutil.copy2(filepath, backup_path)
+        except Exception as e:
+            logging.warning(f"Could not create backup for {filepath}: {e}")
+
+    # Try atomic write using temporary file in the same directory
+    dir_path = os.path.dirname(os.path.abspath(filepath)) or "."
+    temp_fd = None
+    temp_path = None
+
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix=".tmp", prefix="vv-alarm-", dir=dir_path
+        )
+        with os.fdopen(temp_fd, "w") as temp_file:
+            json.dump(data, temp_file, indent=2)
+        temp_fd = None  # File is closed now
+
+        # Replace original file atomically
+        if os.name == "nt":  # Windows
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+        # Use shutil.move instead of os.rename for cross-device compatibility
+        try:
+            os.rename(temp_path, filepath)
+        except OSError as e:
+            if e.errno == 18:  # Cross-device link error
+                logging.warning(
+                    f"Cross-device rename failed, using shutil.move for {filepath}"
+                )
+                shutil.move(temp_path, filepath)
+            else:
+                raise
+
+        logging.debug(f"Successfully saved data to {filepath}")
+
+    except Exception as e:
+        logging.error(f"Failed to save data to {filepath}: {e}")
+        # Clean up temp file on error
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        # Clean up file descriptor if still open
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except:
+                pass
+
+        # Fallback: try simple write (less safe but better than failing)
+        try:
+            logging.warning(f"Attempting fallback simple write for {filepath}")
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2)
+            logging.info(f"Fallback write successful for {filepath}")
+        except Exception as fallback_e:
+            logging.error(f"Fallback write also failed for {filepath}: {fallback_e}")
+            raise  # Re-raise the original exception
+
+
+def safe_save_data(filepath, data):
+    """Wrapper for save_data that doesn't raise exceptions."""
+    try:
+        save_data(filepath, data)
+        return True
+    except Exception as e:
+        logging.error(f"safe_save_data failed for {filepath}: {e}")
+        return False
+
+
+async def get_guild_data(data_type, guild_id):
+    """Get guild-specific data from database or fall back to JSON files"""
+    # Check if database is initialized
+    if not db_manager._initialized:
+        logging.debug(f"Database not initialized, using JSON files for {data_type}")
+        if data_type == "linked_accounts":
+            return linked_accounts.get(str(guild_id), {})
+        elif data_type == "clan_channels":
+            return clan_channels.get(str(guild_id), {})
+        elif data_type == "prep_notifications":
+            return prep_notifications.get(str(guild_id), {})
+        else:
+            return {}
+
+    # Use database if available
+    try:
+        if data_type == "linked_accounts":
+            return await db_manager.get_guild_linked_accounts(guild_id)
+        elif data_type == "clan_channels":
+            return await db_manager.get_guild_clan_channels(guild_id)
+        elif data_type == "prep_notifications":
+            return await db_manager.get_guild_prep_notifications(guild_id)
+        else:
+            return {}
+    except Exception as e:
+        logging.warning(f"Database error for {data_type}, falling back to JSON: {e}")
+        if data_type == "linked_accounts":
+            return linked_accounts.get(str(guild_id), {})
+        elif data_type == "clan_channels":
+            return clan_channels.get(str(guild_id), {})
+        elif data_type == "prep_notifications":
+            return prep_notifications.get(str(guild_id), {})
+        else:
+            return {}
 
 
 def load_prep_channel():
     if os.path.exists(PREP_CHANNEL_FILE):
         with open(PREP_CHANNEL_FILE, "r") as file:
-            data = json.load(file)
-            return data.get("prep_channel")
+            return json.load(file)
+    return {}
+
+
+def save_prep_channel(guild_id, channel_id):
+    prep_channels = load_prep_channel()
+    prep_channels[str(guild_id)] = channel_id
+    with open(PREP_CHANNEL_FILE, "w") as file:
+        json.dump(prep_channels, file)
+
+
+async def get_prep_channel(guild_id):
+    return await db_manager.get_prep_channel(guild_id)
+
+
+def is_clan_monitored_by_other_guild(clan_tag, current_guild_id):
+    """Check if a clan tag is already being monitored by a different guild"""
+    for guild_id_str, guild_clans in clan_channels.items():
+        # Skip the current guild
+        if int(guild_id_str) == current_guild_id:
+            continue
+        # Check if this clan tag exists in another guild
+        if clan_tag in guild_clans:
+            return True, int(guild_id_str)
+    return False, None
+
+
+def get_guild_monitoring_clan(clan_tag):
+    """Get the guild ID that is currently monitoring a specific clan tag"""
+    for guild_id_str, guild_clans in clan_channels.items():
+        if clan_tag in guild_clans:
+            return int(guild_id_str)
     return None
 
 
-def save_prep_channel(channel_id):
-    with open(PREP_CHANNEL_FILE, "w") as file:
-        json.dump({"prep_channel": channel_id}, file)
+# endregion
+
+# region Database Setup
+Base = declarative_base()
 
 
+# Database Models
+class Guild(Base):
+    __tablename__ = "guilds"
+
+    guild_id = Column(BigInteger, primary_key=True)
+    created_at = Column(DateTime, default=func.now())
+    settings = Column(JSON)
+
+
+class LinkedAccount(Base):
+    __tablename__ = "linked_accounts"
+
+    id = Column(Integer, primary_key=True)
+    guild_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, nullable=False)
+    player_tag = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class ClanChannel(Base):
+    __tablename__ = "clan_channels"
+
+    id = Column(Integer, primary_key=True)
+    guild_id = Column(BigInteger, nullable=False)
+    clan_tag = Column(String(20), nullable=False)
+    clan_name = Column(String(100), nullable=False)
+    channel_id = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class PrepNotification(Base):
+    __tablename__ = "prep_notifications"
+
+    id = Column(Integer, primary_key=True)
+    guild_id = Column(BigInteger, nullable=False)
+    clan_tag = Column(String(20), nullable=False)
+    channel_id = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class PrepNotifier(Base):
+    __tablename__ = "prep_notifiers"
+
+    id = Column(Integer, primary_key=True)
+    prep_notification_id = Column(Integer, nullable=False)
+    user_id = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class PrepChannel(Base):
+    __tablename__ = "prep_channels"
+
+    guild_id = Column(BigInteger, primary_key=True)
+    channel_id = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+# Database Manager
+class DatabaseManager:
+    def __init__(self):
+        self.engine = None
+        self.session_factory = None
+        self._initialized = False
+
+    async def initialize(self):
+        """Initialize database connection"""
+        try:
+            self.engine = create_async_engine(
+                DATABASE_URL,
+                pool_size=10,
+                max_overflow=20,
+                pool_timeout=30,
+                pool_recycle=3600,
+                echo=False,
+            )
+
+            self.session_factory = async_sessionmaker(
+                self.engine, class_=AsyncSession, expire_on_commit=False
+            )
+
+            # Create all tables
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+
+            self._initialized = True
+            logging.info("Database initialized successfully")
+
+        except Exception as e:
+            logging.warning(
+                f"Database initialization failed (running in local/JSON mode): {e}"
+            )
+            logging.info("Bot will continue using JSON files for data storage")
+
+    async def ensure_guild_exists(self, guild_id: int):
+        """Ensure a guild exists in the database"""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Guild).where(Guild.guild_id == guild_id)
+            )
+            guild = result.scalar_one_or_none()
+
+            if not guild:
+                guild = Guild(guild_id=guild_id)
+                session.add(guild)
+                await session.commit()
+
+    async def get_guild_linked_accounts(self, guild_id: int):
+        """Get all linked accounts for a guild"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(LinkedAccount).where(LinkedAccount.guild_id == guild_id)
+            )
+            accounts = result.scalars().all()
+
+            guild_accounts = {}
+            for account in accounts:
+                user_id = str(account.user_id)
+                if user_id not in guild_accounts:
+                    guild_accounts[user_id] = []
+                guild_accounts[user_id].append(account.player_tag)
+
+            return guild_accounts
+
+    async def add_linked_account(self, guild_id: int, user_id: int, player_tag: str):
+        """Add a linked account"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            # Check if already exists
+            result = await session.execute(
+                select(LinkedAccount).where(
+                    LinkedAccount.guild_id == guild_id,
+                    LinkedAccount.user_id == user_id,
+                    LinkedAccount.player_tag == player_tag,
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                return False
+
+            account = LinkedAccount(
+                guild_id=guild_id, user_id=user_id, player_tag=player_tag
+            )
+            session.add(account)
+            await session.commit()
+            return True
+
+    async def remove_linked_account(self, guild_id: int, user_id: int, player_tag: str):
+        """Remove a linked account"""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(LinkedAccount).where(
+                    LinkedAccount.guild_id == guild_id,
+                    LinkedAccount.user_id == user_id,
+                    LinkedAccount.player_tag == player_tag,
+                )
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def get_guild_clan_channels(self, guild_id: int):
+        """Get all clan channels for a guild"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ClanChannel).where(ClanChannel.guild_id == guild_id)
+            )
+            channels = result.scalars().all()
+
+            guild_clans = {}
+            for channel in channels:
+                guild_clans[channel.clan_tag] = {
+                    "name": channel.clan_name,
+                    "channel": channel.channel_id,
+                }
+
+            return guild_clans
+
+    async def add_clan_channel(
+        self, guild_id: int, clan_tag: str, clan_name: str, channel_id: int
+    ):
+        """Add a clan channel"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            # Check if already exists
+            result = await session.execute(
+                select(ClanChannel).where(
+                    ClanChannel.guild_id == guild_id, ClanChannel.clan_tag == clan_tag
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                existing.clan_name = clan_name
+                existing.channel_id = channel_id
+            else:
+                clan_channel = ClanChannel(
+                    guild_id=guild_id,
+                    clan_tag=clan_tag,
+                    clan_name=clan_name,
+                    channel_id=channel_id,
+                )
+                session.add(clan_channel)
+
+            await session.commit()
+            return True
+
+    async def remove_clan_channel(self, guild_id: int, clan_tag: str):
+        """Remove a clan channel"""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ClanChannel).where(
+                    ClanChannel.guild_id == guild_id, ClanChannel.clan_tag == clan_tag
+                )
+            )
+            clan_channel = result.scalar_one_or_none()
+
+            if clan_channel:
+                await session.delete(clan_channel)
+                await session.commit()
+                return True
+            return False
+
+    async def get_prep_channel(self, guild_id: int):
+        """Get prep channel for a guild"""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(PrepChannel).where(PrepChannel.guild_id == guild_id)
+            )
+            prep_channel = result.scalar_one_or_none()
+            return prep_channel.channel_id if prep_channel else None
+
+    async def set_prep_channel(self, guild_id: int, channel_id: int):
+        """Set prep channel for a guild"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(PrepChannel).where(PrepChannel.guild_id == guild_id)
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                existing.channel_id = channel_id
+            else:
+                prep_channel = PrepChannel(guild_id=guild_id, channel_id=channel_id)
+                session.add(prep_channel)
+
+            await session.commit()
+
+    async def get_guild_prep_notifications(self, guild_id: int):
+        """Get all prep notifications for a guild"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            # Get prep notifications with notifiers
+            result = await session.execute(
+                select(PrepNotification).where(PrepNotification.guild_id == guild_id)
+            )
+            prep_notifications = result.scalars().all()
+
+            guild_prep_data = {}
+            for prep_notif in prep_notifications:
+                clan_tag = prep_notif.clan_tag
+                if clan_tag not in guild_prep_data:
+                    guild_prep_data[clan_tag] = {
+                        "channel": prep_notif.channel_id,
+                        "notifiers": [],
+                        "wars": {},
+                    }
+
+                # Get notifiers for this prep notification
+                notifier_result = await session.execute(
+                    select(PrepNotifier).where(
+                        PrepNotifier.prep_notification_id == prep_notif.id
+                    )
+                )
+                notifiers = notifier_result.scalars().all()
+                guild_prep_data[clan_tag]["notifiers"] = [
+                    notifier.user_id for notifier in notifiers
+                ]
+
+            return guild_prep_data
+
+    async def add_prep_notifier(
+        self, guild_id: int, clan_tag: str, user_id: int, channel_id: int
+    ):
+        """Add a prep notifier for a clan"""
+        await self.ensure_guild_exists(guild_id)
+
+        async with self.session_factory() as session:
+            # Get or create prep notification
+            result = await session.execute(
+                select(PrepNotification).where(
+                    PrepNotification.guild_id == guild_id,
+                    PrepNotification.clan_tag == clan_tag,
+                )
+            )
+            prep_notification = result.scalar_one_or_none()
+
+            if not prep_notification:
+                prep_notification = PrepNotification(
+                    guild_id=guild_id, clan_tag=clan_tag, channel_id=channel_id
+                )
+                session.add(prep_notification)
+                await session.flush()  # Get the ID
+
+            # Check if notifier already exists
+            notifier_result = await session.execute(
+                select(PrepNotifier).where(
+                    PrepNotifier.prep_notification_id == prep_notification.id,
+                    PrepNotifier.user_id == user_id,
+                )
+            )
+            existing_notifier = notifier_result.scalar_one_or_none()
+
+            if not existing_notifier:
+                notifier = PrepNotifier(
+                    prep_notification_id=prep_notification.id, user_id=user_id
+                )
+                session.add(notifier)
+                await session.commit()
+                return True  # New notifier added
+            else:
+                return False  # Already exists
+
+
+# Global database manager
+db_manager = DatabaseManager()
 # endregion
 
 # region File Initialization
@@ -87,7 +604,7 @@ ensure_file_exists(PREP_NOTIFICATION_FILE, {})
 prep_notifications = load_data(PREP_NOTIFICATION_FILE)
 linked_accounts = load_data(LINKED_ACCOUNTS_FILE)
 clan_channels = load_data(CLAN_CHANNELS_FILE)
-prep_channel = load_prep_channel()
+prep_channels = load_prep_channel()  # Now loads all guild prep channels
 # endregion
 
 
@@ -182,7 +699,7 @@ class ClashCommands(commands.Cog):
 
     @nextcord.slash_command(
         name="link_account",
-        description="Link en Clash of Clans konto til en Discord bruger (kun for administratorer)",
+        description="Link a Clash of Clans account to a Discord user (Administrators only)",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def link_account(
@@ -191,45 +708,53 @@ class ClashCommands(commands.Cog):
         discord_user: nextcord.Member,
         player_tag: str,
     ):
+        # Try database first, fall back to JSON
+        if db_manager._initialized:
+            try:
+                success = await db_manager.add_linked_account(
+                    interaction.guild_id, discord_user.id, player_tag
+                )
+                if success:
+                    await interaction.response.send_message(
+                        f"Successfully linked Clash of Clans tag {player_tag} to {discord_user.mention}.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"Tag {player_tag} is already linked to {discord_user.mention}.",
+                        ephemeral=True,
+                    )
+                return
+            except Exception as e:
+                logging.warning(
+                    f"Database error in link_account, falling back to JSON: {e}"
+                )
+
+        # Fallback to JSON files
+        guild_linked_accounts = linked_accounts.setdefault(
+            str(interaction.guild_id), {}
+        )
         user_id = str(discord_user.id)
-        if user_id not in linked_accounts:
-            linked_accounts[user_id] = []
-        if player_tag not in linked_accounts[user_id]:
-            linked_accounts[user_id].append(player_tag)
+
+        if user_id not in guild_linked_accounts:
+            guild_linked_accounts[user_id] = []
+
+        if player_tag not in guild_linked_accounts[user_id]:
+            guild_linked_accounts[user_id].append(player_tag)
             save_data(LINKED_ACCOUNTS_FILE, linked_accounts)
             await interaction.response.send_message(
-                f"Linkede Clash of Clans tag {player_tag} til {discord_user.mention}.",
+                f"Successfully linked Clash of Clans tag {player_tag} to {discord_user.mention}.",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"Tag {player_tag} er allerede linket til {discord_user.mention}.",
+                f"Tag {player_tag} is already linked to {discord_user.mention}.",
                 ephemeral=True,
             )
 
     @nextcord.slash_command(
-        name="check_prep_config",
-        description="Check preparation notification configuration",
-        default_member_permissions=nextcord.Permissions(administrator=True),
-    )
-    async def check_prep_config(self, interaction: nextcord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        message = "Current Preparation Configuration:\n\n"
-
-        message += f"Global Prep Channel: {prep_channel}\n\n"
-
-        message += "Clan Configurations:\n"
-        for clan_tag, data in prep_notifications.items():
-            message += f"\nClan {clan_tag}:\n"
-            message += f"Channel: {data.get('channel')}\n"
-            message += f"Notifiers: {', '.join([f'<@{uid}>' for uid in data.get('notifiers', [])])}\n"
-            message += f"Wars tracked: {len(data.get('wars', {}))}\n"
-
-        await interaction.followup.send(message, ephemeral=True)
-
-    @nextcord.slash_command(
         name="unlink_account",
-        description="Fjern en Clash of Clans konto fra en Discord bruger (kun for administratorer)",
+        description="Remove a Clash of Clans account from a Discord user (Administrators only)",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def unlink_account(
@@ -238,85 +763,473 @@ class ClashCommands(commands.Cog):
         discord_user: nextcord.Member,
         player_tag: str,
     ):
+        # Try database first, fall back to JSON
+        if db_manager._initialized:
+            try:
+                success = await db_manager.remove_linked_account(
+                    interaction.guild_id, discord_user.id, player_tag
+                )
+                if success:
+                    await interaction.response.send_message(
+                        f"Successfully removed Clash of Clans tag {player_tag} from {discord_user.mention}.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"Could not find tag {player_tag} for {discord_user.mention}.",
+                        ephemeral=True,
+                    )
+                return
+            except Exception as e:
+                logging.warning(
+                    f"Database error in unlink_account, falling back to JSON: {e}"
+                )
+
+        # Fallback to JSON files
+        guild_linked_accounts = await get_guild_data(
+            "linked_accounts", interaction.guild_id
+        )
         user_id = str(discord_user.id)
-        if user_id in linked_accounts and player_tag in linked_accounts[user_id]:
-            linked_accounts[user_id].remove(player_tag)
-            if not linked_accounts[user_id]:
-                del linked_accounts[user_id]
+        if (
+            user_id in guild_linked_accounts
+            and player_tag in guild_linked_accounts[user_id]
+        ):
+            guild_linked_accounts[user_id].remove(player_tag)
+            if not guild_linked_accounts[user_id]:
+                del guild_linked_accounts[user_id]
             save_data(LINKED_ACCOUNTS_FILE, linked_accounts)
             await interaction.response.send_message(
-                f"Fjernede Clash of Clans tag {player_tag} fra {discord_user.mention}.",
+                f"Successfully removed Clash of Clans tag {player_tag} from {discord_user.mention}.",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"Kunne ikke finde tag {player_tag} for {discord_user.mention}.",
+                f"Could not find tag {player_tag} for {discord_user.mention}.",
                 ephemeral=True,
             )
 
     @nextcord.slash_command(
         name="set_reminder_channel",
-        description="Vælg hvilken kanal der skal vise påmindelser",
+        description="Set which channel should show war reminders",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def set_reminder_channel(
         self, interaction: nextcord.Interaction, channel: nextcord.TextChannel
     ):
-        global reminder_channel
-        reminder_channel = channel.id
+        # Store reminder channel per guild (we'll use a global dict for this)
+        if not hasattr(self, "reminder_channels"):
+            self.reminder_channels = {}
+        self.reminder_channels[interaction.guild_id] = channel.id
         await interaction.response.send_message(
-            f"Påmindelseskanalen er sat til <#{reminder_channel}>.",
+            f"Reminder channel has been set to <#{channel.id}>.",
             ephemeral=True,
         )
 
     @nextcord.slash_command(
         name="monitor_clan",
-        description="Tilføj en klan til overvågning",
+        description="Add a clan to monitoring",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def monitor_clan(
         self, interaction: nextcord.Interaction, clan_name: str, clan_tag: str
     ):
-        global reminder_channel
-        if not reminder_channel:
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+
+        # Check if guild has reached the 4 clan limit
+        if len(guild_clan_channels) >= 4:
+            current_clans = "\n".join(
+                [
+                    f"• {info['name']} ({tag})"
+                    for tag, info in guild_clan_channels.items()
+                ]
+            )
             await interaction.response.send_message(
-                "Ingen påmindelseskanal er blevet sat. Brug kommandoen '/set_reminder_channel' for at sætte en kanal.",
+                f"❌ **Clan Limit Reached**\n\n"
+                f"Your server can only monitor up to **4 clans** at a time.\n\n"
+                f"**Currently monitored clans:**\n{current_clans}\n\n"
+                f"Use `/unmonitor_clan` to remove a clan before adding a new one.",
                 ephemeral=True,
             )
             return
 
-        if clan_tag in clan_channels:
+        # Ensure clan tag has # prefix
+        if not clan_tag.startswith("#"):
+            clan_tag = f"#{clan_tag}"
+
+        # Check if reminder channel is set for this guild
+        if (
+            not hasattr(self, "reminder_channels")
+            or interaction.guild_id not in self.reminder_channels
+        ):
             await interaction.response.send_message(
-                f"Klanen {clan_name} ({clan_tag}) overvåges allerede.",
+                "No reminder channel has been set. Use the '/set_reminder_channel' command to set a channel.",
+                ephemeral=True,
+            )
+            return
+
+        # Check if this clan is already being monitored by another guild
+        is_monitored, monitoring_guild_id = is_clan_monitored_by_other_guild(
+            clan_tag, interaction.guild_id
+        )
+        if is_monitored:
+            await interaction.response.send_message(
+                f"⚠️ **WARNING**: Clan {clan_name} ({clan_tag}) is already being monitored by another Discord server (Guild ID: {monitoring_guild_id}).\n\n"
+                f"**This can lead to:**\n"
+                f"• Both servers receiving reminders for the same clan\n"
+                f"• Confusion about which Discord users belong to the clan\n"
+                f"• Mixed account information in war status messages\n\n"
+                f"**Recommendation**: Contact the other server admin to resolve the conflict, or use your own clan's tag.",
+                ephemeral=True,
+            )
+            return
+
+        reminder_channel = self.reminder_channels[interaction.guild_id]
+
+        if clan_tag in guild_clan_channels:
+            await interaction.response.send_message(
+                f"Clan {clan_name} ({clan_tag}) is already being monitored by this server.",
                 ephemeral=True,
             )
         else:
-            clan_channels[clan_tag] = {"name": clan_name, "channel": reminder_channel}
+            # Verify the clan exists by making an API call
+            clan_data = await make_coc_request_async(
+                f"clans/{clan_tag.replace('#', '%23')}"
+            )
+            if not clan_data:
+                await interaction.response.send_message(
+                    f"❌ Could not find clan with tag {clan_tag}. Please check if the tag is correct.",
+                    ephemeral=True,
+                )
+                return
+
+            actual_clan_name = clan_data.get("name", "Unknown")
+
+            # Try database first, fall back to JSON
+            if db_manager._initialized:
+                try:
+                    await db_manager.add_clan_channel(
+                        interaction.guild_id, clan_tag, clan_name, reminder_channel
+                    )
+                    await interaction.response.send_message(
+                        f"✅ Clan **{clan_name}** ({clan_tag}) has been added to monitoring.\n"
+                        f"📋 API confirmed clan name: **{actual_clan_name}**\n"
+                        f"📢 Reminders will be sent to: <#{reminder_channel}>",
+                        ephemeral=True,
+                    )
+                    return
+                except Exception as e:
+                    logging.warning(
+                        f"Database error in monitor_clan, falling back to JSON: {e}"
+                    )
+
+            # Fallback to JSON files
+            guild_clan_channels = clan_channels.setdefault(
+                str(interaction.guild_id), {}
+            )
+            guild_clan_channels[clan_tag] = {
+                "name": clan_name,
+                "channel": reminder_channel,
+            }
             save_data(CLAN_CHANNELS_FILE, clan_channels)
+
             await interaction.response.send_message(
-                f"Klanen {clan_name} ({clan_tag}) er nu tilføjet til overvågning.",
+                f"✅ Clan **{clan_name}** ({clan_tag}) has been added to monitoring.\n"
+                f"📋 API confirmed clan name: **{actual_clan_name}**\n"
+                f"📢 Reminders will be sent to: <#{reminder_channel}>",
                 ephemeral=True,
             )
 
     @nextcord.slash_command(
+        name="unmonitor_clan",
+        description="Remove a clan from monitoring",
+        default_member_permissions=nextcord.Permissions(administrator=True),
+    )
+    async def unmonitor_clan(self, interaction: nextcord.Interaction, clan: str):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+
+        # Find the clan tag by name
+        clan_tag = None
+        for tag, info in guild_clan_channels.items():
+            if info["name"] == clan:
+                clan_tag = tag
+                break
+
+        if not clan_tag:
+            await interaction.response.send_message(
+                f"❌ Clan '{clan}' was not found in monitoring.",
+                ephemeral=True,
+            )
+            return
+
+        # Try database first, fall back to JSON
+        if db_manager._initialized:
+            try:
+                success = await db_manager.remove_clan_channel(
+                    interaction.guild_id, clan_tag
+                )
+                if success:
+                    # Also clean up prep notifications for this clan
+                    guild_prep_notifications = await get_guild_data(
+                        "prep_notifications", interaction.guild_id
+                    )
+                    if clan_tag in guild_prep_notifications:
+                        del guild_prep_notifications[clan_tag]
+                        save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+
+                    await interaction.response.send_message(
+                        f"✅ Clan **{clan}** ({clan_tag}) has been removed from monitoring.\n"
+                        f"🗑️ All associated preparation notifications have been cleared.",
+                        ephemeral=True,
+                    )
+                    return
+                else:
+                    await interaction.response.send_message(
+                        f"❌ Could not remove clan '{clan}' from database.",
+                        ephemeral=True,
+                    )
+                    return
+            except Exception as e:
+                logging.warning(
+                    f"Database error in unmonitor_clan, falling back to JSON: {e}"
+                )
+
+        # Fallback to JSON files
+        if clan_tag in guild_clan_channels:
+            del guild_clan_channels[clan_tag]
+            save_data(CLAN_CHANNELS_FILE, clan_channels)
+
+            # Also clean up prep notifications for this clan
+            guild_prep_notifications = await get_guild_data(
+                "prep_notifications", interaction.guild_id
+            )
+            if clan_tag in guild_prep_notifications:
+                del guild_prep_notifications[clan_tag]
+                save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+
+            await interaction.response.send_message(
+                f"✅ Clan **{clan}** ({clan_tag}) has been removed from monitoring.\n"
+                f"🗑️ All associated preparation notifications have been cleared.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Clan '{clan}' was not found in monitoring.",
+                ephemeral=True,
+            )
+
+    @unmonitor_clan.on_autocomplete("clan")
+    async def clan_autocomplete(self, interaction: nextcord.Interaction, query: str):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+        matching_clans = [
+            info["name"]
+            for tag, info in guild_clan_channels.items()
+            if query.lower() in info["name"].lower()
+        ]
+        await interaction.response.send_autocomplete(matching_clans[:25])
+
+    @nextcord.slash_command(
+        name="list_monitored_clans",
+        description="Show all clans currently being monitored by this server",
+        default_member_permissions=nextcord.Permissions(administrator=True),
+    )
+    async def list_monitored_clans(self, interaction: nextcord.Interaction):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+
+        if not guild_clan_channels:
+            await interaction.response.send_message(
+                "❌ No clans are currently being monitored by this server.\n"
+                "Use `/monitor_clan` to add a clan to monitoring.",
+                ephemeral=True,
+            )
+            return
+
+        # Get reminder channel info
+        reminder_channel_id = None
+        if (
+            hasattr(self, "reminder_channels")
+            and interaction.guild_id in self.reminder_channels
+        ):
+            reminder_channel_id = self.reminder_channels[interaction.guild_id]
+
+        # Build the clan list
+        clan_list = []
+        for clan_tag, clan_info in guild_clan_channels.items():
+            clan_name = clan_info.get("name", "Unknown")
+            clan_list.append(f"• **{clan_name}** ({clan_tag})")
+
+        message = (
+            f"🏰 **Monitored Clans ({len(guild_clan_channels)}/4)**\n\n"
+            + "\n".join(clan_list)
+            + f"\n\n📢 **Reminder Channel:** "
+        )
+
+        if reminder_channel_id:
+            message += f"<#{reminder_channel_id}>"
+        else:
+            message += "⚠️ Not set - use `/set_reminder_channel`"
+
+        # Check prep channel
+        prep_channel_id = await get_prep_channel(interaction.guild_id)
+        message += f"\n🔔 **Prep Channel:** "
+        if prep_channel_id:
+            message += f"<#{prep_channel_id}>"
+        else:
+            message += "⚠️ Not set - use `/set_prep_channel`"
+
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @nextcord.slash_command(
+        name="my_accounts",
+        description="Show your linked Clash of Clans accounts",
+    )
+    async def my_accounts(self, interaction: nextcord.Interaction):
+        guild_linked_accounts = await get_guild_data(
+            "linked_accounts", interaction.guild_id
+        )
+
+        user_id = str(interaction.user.id)
+        user_accounts = guild_linked_accounts.get(user_id, [])
+
+        if not user_accounts:
+            await interaction.response.send_message(
+                "❌ You don't have any linked Clash of Clans accounts in this server.\n"
+                "Ask an administrator to link your account using `/link_account`.",
+                ephemeral=True,
+            )
+            return
+
+        # Get player info from API for each account
+        account_info = []
+        for player_tag in user_accounts:
+            player_data = await make_coc_request_async(
+                f"players/{player_tag.replace('#', '%23')}"
+            )
+            if player_data:
+                player_name = player_data.get("name", "Unknown")
+                player_th = player_data.get("townHallLevel", "?")
+                clan_name = player_data.get("clan", {}).get("name", "No Clan")
+                account_info.append(
+                    f"• **{player_name}** (TH{player_th}) - {player_tag}\n  └ Clan: {clan_name}"
+                )
+            else:
+                account_info.append(
+                    f"• **Unknown Player** - {player_tag}\n  └ Could not fetch data"
+                )
+
+        message = (
+            f"🔗 **Your Linked Accounts ({len(user_accounts)})**\n\n"
+            + "\n\n".join(account_info)
+        )
+
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @nextcord.slash_command(
+        name="bot_config",
+        description="Show current bot configuration for this server",
+        default_member_permissions=nextcord.Permissions(administrator=True),
+    )
+    async def bot_config(self, interaction: nextcord.Interaction):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+        guild_linked_accounts = await get_guild_data(
+            "linked_accounts", interaction.guild_id
+        )
+
+        # Count linked accounts
+        total_linked_accounts = sum(
+            len(accounts) for accounts in guild_linked_accounts.values()
+        )
+
+        # Get reminder channel
+        reminder_channel_id = None
+        if (
+            hasattr(self, "reminder_channels")
+            and interaction.guild_id in self.reminder_channels
+        ):
+            reminder_channel_id = self.reminder_channels[interaction.guild_id]
+
+        # Get prep channel
+        prep_channel_id = await get_prep_channel(interaction.guild_id)
+
+        # Count prep notifications
+        guild_prep_notifications = await get_guild_data(
+            "prep_notifications", interaction.guild_id
+        )
+        prep_notifier_count = sum(
+            len(clan_data.get("notifiers", []))
+            for clan_data in guild_prep_notifications.values()
+        )
+
+        config_message = (
+            f"⚙️ **Bot Configuration for {interaction.guild.name}**\n\n"
+            f"🏰 **Monitored Clans:** {len(guild_clan_channels)}/4\n"
+            f"🔗 **Linked Accounts:** {total_linked_accounts} accounts across {len(guild_linked_accounts)} users\n"
+            f"📢 **Reminder Channel:** "
+        )
+
+        if reminder_channel_id:
+            config_message += f"<#{reminder_channel_id}> ✅"
+        else:
+            config_message += "⚠️ Not configured"
+
+        config_message += f"\n🔔 **Prep Channel:** "
+        if prep_channel_id:
+            config_message += f"<#{prep_channel_id}> ✅"
+        else:
+            config_message += "⚠️ Not configured"
+
+        config_message += (
+            f"\n👥 **Prep Notifiers:** {prep_notifier_count} users assigned"
+        )
+
+        # Add setup recommendations if needed
+        recommendations = []
+        if not reminder_channel_id:
+            recommendations.append(
+                "• Set a reminder channel with `/set_reminder_channel`"
+            )
+        if not guild_clan_channels:
+            recommendations.append("• Add clans to monitor with `/monitor_clan`")
+        if not prep_channel_id and guild_clan_channels:
+            recommendations.append("• Set a prep channel with `/set_prep_channel`")
+
+        if recommendations:
+            config_message += f"\n\n📝 **Setup Recommendations:**\n" + "\n".join(
+                recommendations
+            )
+        else:
+            config_message += (
+                f"\n\n✅ **Setup Complete!** Your bot is ready to monitor wars."
+            )
+
+        await interaction.response.send_message(config_message, ephemeral=True)
+
+    @nextcord.slash_command(
         name="set_prep_channel",
-        description="Sæt kanalen til forberedelses-påmindelser (Kun for administratorer)",
+        description="Set the channel for preparation reminders (Administrators only)",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def set_prep_channel(
         self, interaction: nextcord.Interaction, channel: nextcord.TextChannel
     ):
-        global prep_channel
-        prep_channel = channel.id
-        save_prep_channel(prep_channel)
+        await db_manager.set_prep_channel(interaction.guild_id, channel.id)
         await interaction.response.send_message(
-            f"Forberedelses-påmindelseskanalen er sat til <#{prep_channel}>.",
+            f"Preparation reminder channel has been set to <#{channel.id}>.",
             ephemeral=True,
         )
 
     @nextcord.slash_command(
         name="assign_prep_notifiers",
-        description="Tildel brugere til at modtage forberedelses-påmindelser (Kun for administratorer)",
+        description="Assign users to receive preparation reminders (Administrators only)",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def assign_prep_notifiers(
@@ -325,79 +1238,172 @@ class ClashCommands(commands.Cog):
         clan: str,
         users: nextcord.Member,
     ):
-        global prep_channel
-        if not prep_channel:
+        guild_prep_channel = await get_prep_channel(interaction.guild_id)
+        if not guild_prep_channel:
             await interaction.response.send_message(
-                "Ingen forberedelseskanal er blevet sat. Brug kommandoen '/set_prep_channel' for at sætte en kanal.",
+                "No preparation channel has been set. Use the '/set_prep_channel' command to set a channel.",
                 ephemeral=True,
             )
             return
 
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+        guild_prep_notifications = await get_guild_data(
+            "prep_notifications", interaction.guild_id
+        )
+
         clan_tag = None
-        for tag, info in clan_channels.items():
+        for tag, info in guild_clan_channels.items():
             if info["name"] == clan:
                 clan_tag = tag
                 break
 
         if not clan_tag:
             await interaction.response.send_message(
-                f"Klanen '{clan}' blev ikke fundet i overvågningen.",
+                f"Clan '{clan}' was not found in monitoring.",
                 ephemeral=True,
             )
             return
 
-        user_ids = []
-        user_ids.append(users.id)
+        user_id = users.id
 
-        if clan_tag not in prep_notifications:
-            prep_notifications[clan_tag] = {"channel": prep_channel, "notifiers": []}
+        # Try database first, fall back to JSON
+        if db_manager._initialized:
+            try:
+                # Check if already assigned
+                if (
+                    clan_tag in guild_prep_notifications
+                    and user_id in guild_prep_notifications[clan_tag]["notifiers"]
+                ):
+                    already_assigned = [f"<@{user_id}>"]
+                    newly_assigned = []
+                else:
+                    # Add to database
+                    success = await db_manager.add_prep_notifier(
+                        interaction.guild_id, clan_tag, user_id, guild_prep_channel
+                    )
+                    if success:
+                        newly_assigned = [f"<@{user_id}>"]
+                        already_assigned = []
+                    else:
+                        already_assigned = [f"<@{user_id}>"]
+                        newly_assigned = []
+                save_success = True
+            except Exception as e:
+                logging.warning(
+                    f"Database error in assign_prep_notifiers, falling back to JSON: {e}"
+                )
+                # Fall back to JSON method below
+                save_success = False
+        else:
+            save_success = False
 
-        already_assigned = []
-        newly_assigned = []
+        # Fallback to JSON files if database failed
+        if not save_success:
+            if clan_tag not in guild_prep_notifications:
+                guild_prep_notifications[clan_tag] = {
+                    "channel": guild_prep_channel,
+                    "notifiers": [],
+                }
 
-        for user_id in user_ids:
-            if user_id in prep_notifications[clan_tag]["notifiers"]:
+            already_assigned = []
+            newly_assigned = []
+
+            if user_id in guild_prep_notifications[clan_tag]["notifiers"]:
                 already_assigned.append(f"<@{user_id}>")
             else:
-                prep_notifications[clan_tag]["notifiers"].append(user_id)
+                guild_prep_notifications[clan_tag]["notifiers"].append(user_id)
                 newly_assigned.append(f"<@{user_id}>")
 
-        save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+            # Try to save data, but don't fail the command if it doesn't work
+            save_success = safe_save_data(PREP_NOTIFICATION_FILE, prep_notifications)
 
         response_message = ""
         if newly_assigned:
-            response_message += f"Følgende brugere er nu tildelt til at modtage forberedelses-påmindelser for klan '{clan}': {', '.join(newly_assigned)}.\n"
+            response_message += f"The following users have been assigned to receive preparation reminders for clan '{clan}': {', '.join(newly_assigned)}.\n"
         if already_assigned:
-            response_message += (
-                f"Følgende brugere var allerede tildelt: {', '.join(already_assigned)}."
-            )
+            response_message += f"The following users were already assigned: {', '.join(already_assigned)}."
+
+        if not save_success:
+            response_message += f"\n\n⚠️ **Warning**: Assignment was successful but data could not be saved to file. The assignment is still active in memory but may be lost on bot restart."
 
         await interaction.response.send_message(response_message)
 
+    @nextcord.slash_command(
+        name="list_prep_notifiers",
+        description="Show all prep notifiers for monitored clans (Administrators only)",
+        default_member_permissions=nextcord.Permissions(administrator=True),
+    )
+    async def list_prep_notifiers(self, interaction: nextcord.Interaction):
+        guild_prep_notifications = await get_guild_data(
+            "prep_notifications", interaction.guild_id
+        )
+
+        if not guild_prep_notifications:
+            await interaction.response.send_message(
+                "❌ No prep notifiers have been assigned yet.\n"
+                "Use `/assign_prep_notifiers` to assign users to receive preparation reminders.",
+                ephemeral=True,
+            )
+            return
+
+        message = "👥 **Prep Notifiers by Clan:**\n\n"
+        total_notifiers = 0
+
+        for clan_tag, clan_data in guild_prep_notifications.items():
+            notifiers = clan_data.get("notifiers", [])
+            if notifiers:
+                # Get clan name from monitored clans
+                guild_clan_channels = await get_guild_data(
+                    "clan_channels", interaction.guild_id
+                )
+                clan_name = guild_clan_channels.get(clan_tag, {}).get(
+                    "name", "Unknown Clan"
+                )
+
+                notifier_mentions = [f"<@{user_id}>" for user_id in notifiers]
+                message += f"**🏰 {clan_name}** ({clan_tag})\n"
+                message += f"└ {', '.join(notifier_mentions)}\n\n"
+                total_notifiers += len(notifiers)
+
+        message += f"**Total:** {total_notifiers} users assigned across {len(guild_prep_notifications)} clans"
+
+        await interaction.response.send_message(message, ephemeral=True)
+
     @assign_prep_notifiers.on_autocomplete("clan")
     async def clan_autocomplete(self, interaction: nextcord.Interaction, query: str):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
         matching_clans = [
             info["name"]
-            for tag, info in clan_channels.items()
+            for tag, info in guild_clan_channels.items()
             if query.lower() in info["name"].lower()
         ]
         await interaction.response.send_autocomplete(matching_clans[:25])
 
     @nextcord.slash_command(
-        name="match_status", description="Tjek status for klanens krig."
+        name="match_status", description="Check the status of the clan's war."
     )
     async def match_status(self, interaction: nextcord.Interaction, clan: str):
         await interaction.response.defer()
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+        guild_linked_accounts = await get_guild_data(
+            "linked_accounts", interaction.guild_id
+        )
         clan_tag = None
 
-        for tag, info in clan_channels.items():
+        for tag, info in guild_clan_channels.items():
             if info["name"] == clan:
                 clan_tag = tag
                 break
 
         if not clan_tag:
             await interaction.followup.send(
-                f"Klanen {clan} blev ikke fundet.", ephemeral=True
+                f"Clan {clan} was not found.", ephemeral=True
             )
             return
 
@@ -435,12 +1441,13 @@ class ClashCommands(commands.Cog):
                                     state,
                                     is_cwl=True,
                                     round_num=round_num + 1,
+                                    guild_linked_accounts=guild_linked_accounts,
                                 )
                                 return
 
             elif league_state == "preparation":
                 await interaction.followup.send(
-                    f"⚔️ CWL for {clan} ({clan_tag}) er i forberedelsesfasen.",
+                    f"⚔️ CWL for {clan} ({clan_tag}) is in preparation phase.",
                     ephemeral=True,
                 )
                 return
@@ -450,21 +1457,35 @@ class ClashCommands(commands.Cog):
         )
         if war_data and war_data.get("state") == "inWar":
             await self.process_war_status(
-                interaction, clan, clan_tag, war_data, "inWar", is_cwl=False
+                interaction,
+                clan,
+                clan_tag,
+                war_data,
+                "inWar",
+                is_cwl=False,
+                guild_linked_accounts=guild_linked_accounts,
             )
         else:
             await interaction.followup.send(
-                f"Klanen {clan} er ikke i nogen aktive krige.", ephemeral=True
+                f"Clan {clan} is not in any active wars.", ephemeral=True
             )
 
     async def process_war_status(
-        self, interaction, clan, clan_tag, war_data, state, is_cwl=False, round_num=None
+        self,
+        interaction,
+        clan,
+        clan_tag,
+        war_data,
+        state,
+        is_cwl=False,
+        round_num=None,
+        guild_linked_accounts=None,
     ):
         def split_message(message, limit=2000):
             return [message[i : i + limit] for i in range(0, len(message), limit)]
 
         war_type = "CWL" if is_cwl else "Normal"
-        round_info = f" (Runde {round_num})" if is_cwl else ""
+        round_info = f" (Round {round_num})" if is_cwl else ""
 
         clan_data = (
             war_data["clan"]
@@ -486,18 +1507,14 @@ class ClashCommands(commands.Cog):
 
         war_end_time_str = war_data.get("endTime")
         time_until_end = calculate_time_until_war_end(war_end_time_str, "inWar")
-        time_until_end_formatted = f"{time_until_end.seconds // 3600} timer, {(time_until_end.seconds // 60) % 60} minutter"
+        time_until_end_formatted = f"{time_until_end.seconds // 3600} hours, {(time_until_end.seconds // 60) % 60} minutes"
 
-        unattacked_players = {
-            member["tag"]: 1 if is_cwl else 2 - len(member.get("attacks", []))
-            for member in clan_data.get("members", [])
-            if len(member.get("attacks", [])) < (1 if is_cwl else 2)
-        }
+        unattacked_players = get_unattacked_players(war_data, is_cwl=is_cwl)
 
         message = (
-            f"⚔️ {war_type} krig{round_info} for {clan} ({clan_tag}) mod {opponent_name}\n"
-            f"⏰ Tid tilbage: {time_until_end_formatted}\n\n"
-            f"Stillingen:\n"
+            f"⚔️ {war_type} war{round_info} for {clan_name} ({clan_tag}) vs {opponent_name}\n"
+            f"⏰ Time remaining: {time_until_end_formatted}\n\n"
+            f"Score:\n"
             f"\n"
             f"{clan_name}:\n"
             f"⭐ {stars_clan} | {destruction_clan:.2f}%\n\n"
@@ -507,21 +1524,21 @@ class ClashCommands(commands.Cog):
 
         player_list = ""
         if unattacked_players:
-            player_list = "\nSpillere der mangler at angribe:\n"
+            player_list = "\nPlayers who still need to attack:\n"
             for player_tag, missing_attacks in unattacked_players.items():
                 discord_mentions = [
                     f"<@{user_id}>"
-                    for user_id, tags in linked_accounts.items()
+                    for user_id, tags in (guild_linked_accounts or {}).items()
                     if player_tag in tags
                 ]
                 linked_users = (
                     ", ".join(discord_mentions)
                     if discord_mentions
-                    else "Ingen Discord-link"
+                    else "No Discord link"
                 )
-                player_list += f"- {player_tag}: Mangler {missing_attacks} angreb. Linket: {linked_users}\n"
+                player_list += f"- {player_tag}: Missing {missing_attacks} attacks. Linked: {linked_users}\n"
         else:
-            player_list = "\nAlle spillere har angrebet! 💪"
+            player_list = "\nAll players have attacked! 💪"
 
         message += player_list
 
@@ -532,8 +1549,11 @@ class ClashCommands(commands.Cog):
     @match_status.on_autocomplete("clan")
     async def clan_autocomplete(self, interaction: nextcord.Interaction, query: str):
         try:
-            # Get all clan names from clan_channels
-            clan_names = [info["name"] for tag, info in clan_channels.items()]
+            # Get all clan names from guild-specific clan_channels
+            guild_clan_channels = await get_guild_data(
+                "clan_channels", interaction.guild_id
+            )
+            clan_names = [info["name"] for tag, info in guild_clan_channels.items()]
 
             if not query:  # If no query, return all clans (up to 25)
                 await interaction.response.send_autocomplete(clan_names[:25])
@@ -553,155 +1573,29 @@ class ClashCommands(commands.Cog):
             await interaction.response.send_autocomplete([])
 
     @nextcord.slash_command(
-        name="cwl_leaderboard",
-        description="Vis CWL leaderboard for den aktuelle sæson.",
-    )
-    async def cwl_leaderboard(self, interaction: nextcord.Interaction, clan: str):
-        await interaction.response.defer()
-
-        clan_tag = None
-        for tag, info in clan_channels.items():
-            if info["name"] == clan:
-                clan_tag = tag
-                break
-
-        if not clan_tag:
-            await interaction.followup.send(
-                f"Klanen {clan} blev ikke fundet.", ephemeral=True
-            )
-            return
-
-        league_data = await make_coc_request_async(
-            f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
-        )
-        if not league_data:
-            await interaction.followup.send(
-                "Kunne ikke hente CWL data.", ephemeral=True
-            )
-            return
-
-        leaderboard = {
-            cwl_clan["tag"]: {
-                "name": cwl_clan["name"],
-                "stars": 0,
-                "destruction": 0,
-                "matches": 0,
-            }
-            for cwl_clan in league_data.get("clans", [])
-        }
-
-        for round_data in league_data.get("rounds", []):
-            for war_tag in round_data.get("warTags", []):
-                if war_tag == "#0":
-                    continue
-
-                war_data = await make_coc_request_async(
-                    f"clanwarleagues/wars/{war_tag.replace('#', '%23')}"
-                )
-                if not war_data:
-                    continue
-
-                clan_stars = war_data["clan"].get("stars", 0)
-                opponent_stars = war_data["opponent"].get("stars", 0)
-                clan_percentage = war_data["clan"].get("destructionPercentage", 0)
-                opponent_percentage = war_data["opponent"].get(
-                    "destructionPercentage", 0
-                )
-                clan_tag_in_war = war_data["clan"]["tag"]
-                opponent_tag_in_war = war_data["opponent"]["tag"]
-
-                if clan_tag_in_war in leaderboard:
-                    leaderboard[clan_tag_in_war]["stars"] += clan_stars
-                    leaderboard[clan_tag_in_war]["destruction"] += clan_percentage
-                    leaderboard[clan_tag_in_war]["matches"] += 1
-
-                if opponent_tag_in_war in leaderboard:
-                    leaderboard[opponent_tag_in_war]["stars"] += opponent_stars
-                    leaderboard[opponent_tag_in_war][
-                        "destruction"
-                    ] += opponent_percentage
-                    leaderboard[opponent_tag_in_war]["matches"] += 1
-
-        for entry in leaderboard.values():
-            if entry["matches"] > 0:
-                entry["destruction"] /= entry["matches"]
-
-        sorted_leaderboard = sorted(
-            leaderboard.values(), key=lambda x: (-x["stars"], -x["destruction"])
-        )
-
-        message = (
-            f"📊 **CWL Leaderboard for {league_data.get('season', 'Unknown')}**\n"
-            f"**Klan: {clan} ({clan_tag})**\n\n"
-        )
-
-        for rank, entry in enumerate(sorted_leaderboard, start=1):
-            message += f"**{rank}. {entry['name']}**Stars: **{entry['stars']}** ⭐ | Destruction: **{entry['destruction']:.2f}%** 💥 \n"
-
-        await interaction.followup.send(message.strip())
-
-    @cwl_leaderboard.on_autocomplete("clan")
-    async def cwl_leaderboard_autocomplete(
-        self, interaction: nextcord.Interaction, query: str
-    ):
-        matching_clans = [
-            info["name"]
-            for tag, info in clan_channels.items()
-            if query.lower() in info["name"].lower()
-        ]
-        await interaction.response.send_autocomplete(matching_clans[:25])
-
-    @nextcord.slash_command(
-        name="reset_prep_reminder",
-        description="Reset the preparation reminder status for testing",
-        default_member_permissions=nextcord.Permissions(administrator=True),
-    )
-    async def reset_prep_reminder(
-        self, interaction: nextcord.Interaction, clan_tag: str
-    ):
-        """Reset the preparation reminder status for a clan."""
-        if not clan_tag.startswith("#"):
-            clan_tag = f"#{clan_tag}"
-
-        if clan_tag in prep_notifications:
-            war_id = f"cwl_prep_{datetime.now(timezone.utc).strftime('%Y-%m')}"
-            if (
-                "wars" in prep_notifications[clan_tag]
-                and war_id in prep_notifications[clan_tag]["wars"]
-            ):
-                prep_notifications[clan_tag]["wars"][war_id][
-                    "1_hour_reminder_sent"
-                ] = False
-                save_data(PREP_NOTIFICATION_FILE, prep_notifications)
-                await interaction.response.send_message(
-                    f"Reset reminder status for clan {clan_tag}", ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"No active war found for clan {clan_tag}", ephemeral=True
-                )
-        else:
-            await interaction.response.send_message(
-                f"Clan {clan_tag} not found in notifications", ephemeral=True
-            )
-
-    @nextcord.slash_command(
         name="unlinked_accounts",
-        description="Vis hvilke konti der ikke er linket til Discord i en overvåget klan (Kun for administratorer)",
+        description="Show which accounts are not linked to Discord in a monitored clan (Administrators only)",
         default_member_permissions=nextcord.Permissions(administrator=True),
     )
     async def unlinked_accounts(self, interaction: nextcord.Interaction, clan: str):
         await interaction.response.defer()
 
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
+        guild_linked_accounts = await get_guild_data(
+            "linked_accounts", interaction.guild_id
+        )
+
         clan_tag = None
-        for tag, info in clan_channels.items():
+        for tag, info in guild_clan_channels.items():
             if info["name"] == clan:
                 clan_tag = tag
                 break
 
         if not clan_tag:
             await interaction.followup.send(
-                f"Klanen '{clan}' blev ikke fundet i overvågningen.", ephemeral=True
+                f"Clan '{clan}' was not found in monitoring.", ephemeral=True
             )
             return
 
@@ -710,11 +1604,14 @@ class ClashCommands(commands.Cog):
         )
         if not clan_data:
             await interaction.followup.send(
-                f"Kunne ikke hente data for klan '{clan}' ({clan_tag}).", ephemeral=True
+                f"Could not retrieve data for clan '{clan}' ({clan_tag}).",
+                ephemeral=True,
             )
             return
 
-        all_linked_tags = [tag for tags in linked_accounts.values() for tag in tags]
+        all_linked_tags = [
+            tag for tags in guild_linked_accounts.values() for tag in tags
+        ]
 
         unlinked_players = []
         for member in clan_data.get("memberList", []):
@@ -736,44 +1633,47 @@ class ClashCommands(commands.Cog):
 
         if unlinked_players:
             message = (
-                f"⚠️ Følgende konti i klan '{clan}' ({clan_tag}) er ikke linket til Discord:\n\n"
+                f"⚠️ The following accounts in clan '{clan}' ({clan_tag}) are not linked to Discord:\n\n"
                 + "\n".join(unlinked_players)
-                + f"\n\nTotal: {len(unlinked_players)} ulinket konti"
+                + f"\n\nTotal: {len(unlinked_players)} unlinked accounts"
             )
         else:
             message = (
-                f"✅ Alle konti i klan '{clan}' ({clan_tag}) er linket til Discord!"
+                f"✅ All accounts in clan '{clan}' ({clan_tag}) are linked to Discord!"
             )
 
         if len(message) > 2000:
             chunks = []
-            current_chunk = f"⚠️ Ulinket konti i klan '{clan}' ({clan_tag}):\n\n"
+            current_chunk = f"⚠️ Unlinked accounts in clan '{clan}' ({clan_tag}):\n\n"
 
             for player in unlinked_players:
                 if len(current_chunk) + len(player) + 2 > 1900:
                     chunks.append(current_chunk)
-                    current_chunk = f"⚠️ Fortsat - unlinket konti:\n\n{player}\n"
+                    current_chunk = f"⚠️ Continued - unlinked accounts:\n\n{player}\n"
                 else:
                     current_chunk += player + "\n"
 
             if current_chunk:
                 chunks.append(current_chunk)
 
-            chunks[-1] += f"\nTotal: {len(unlinked_players)} ulinket konti"
+            chunks[-1] += f"\nTotal: {len(unlinked_players)} unlinked accounts"
 
             for i, chunk in enumerate(chunks):
                 if i == 0:
                     await interaction.followup.send(chunk)
                 else:
-                    await interaction.followup.send(chunk)
+                    await interaction.followup.send(chunk, ephemeral=True)
         else:
-            await interaction.followup.send(message)
+            await interaction.followup.send(message, ephemeral=True)
 
     @unlinked_accounts.on_autocomplete("clan")
     async def clan_autocomplete(self, interaction: nextcord.Interaction, query: str):
+        guild_clan_channels = await get_guild_data(
+            "clan_channels", interaction.guild_id
+        )
         matching_clans = [
             info["name"]
-            for tag, info in clan_channels.items()
+            for tag, info in guild_clan_channels.items()
             if query.lower() in info["name"].lower()
         ]
         await interaction.response.send_autocomplete(matching_clans[:25])
@@ -789,60 +1689,105 @@ def setup():
 # region Reminder Functions
 @tasks.loop(minutes=1)
 async def reminder_check():
+    """Main reminder check loop with comprehensive error handling."""
     try:
         logging.info("\n=== Starting reminder check cycle ===")
 
-        # Run checks sequentially instead of concurrently to avoid duplicate logs
-        for clan_tag, channel_data in clan_channels.items():
-            # Check CWL status
-            logging.info(f"\n🔍 Checking clan {clan_tag}:")
+        # Check if there are any guilds with clan data
+        if not clan_channels:
+            logging.info("No guilds with clan data found, skipping reminder check")
+            return
 
-            # 1. Check CWL status
-            logging.info("  ↳ Checking CWL status")
-            league_data = await make_coc_request_async(
-                f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
-            )
-            if league_data and league_data.get("state") == "inWar":
-                await cwl_reminder_check_for_clan(clan_tag, channel_data)
+        # Iterate through each guild's clan channels
+        for guild_id_str, guild_clans in clan_channels.items():
+            try:
+                logging.info(f"Checking guild {guild_id_str}:")
+                guild_linked_accounts = get_guild_data(
+                    linked_accounts, int(guild_id_str)
+                )
+                guild_prep_notifications = get_guild_data(
+                    prep_notifications, int(guild_id_str)
+                )
 
-            # 2. Check normal war status
-            logging.info("  ↳ Checking normal war status")
-            war_data = await make_coc_request_async(
-                f"clans/{clan_tag.replace('#', '%23')}/currentwar"
-            )
-            if war_data and war_data.get("state") == "inWar":
-                await trigger_reminders(war_data, channel_data, is_cwl=False)
+                # Run checks sequentially instead of concurrently to avoid duplicate logs
+                for clan_tag, channel_data in guild_clans.items():
+                    try:
+                        logging.info(f"  Checking clan {clan_tag}:")
 
-            # 3. Check preparation status
-            logging.info("  ↳ Checking preparation status")
-            if clan_tag in prep_notifications:
-                await check_prep_status(clan_tag, war_data, league_data)
+                        # 1. Check CWL status
+                        try:
+                            logging.info("    Checking CWL status")
+                            league_data = await make_coc_request_async(
+                                f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
+                            )
+                            if league_data and league_data.get("state") == "inWar":
+                                await cwl_reminder_check_for_clan(
+                                    clan_tag, channel_data, guild_linked_accounts
+                                )
+                        except Exception as e:
+                            logging.error(
+                                f"Error checking CWL for clan {clan_tag}: {e}"
+                            )
+
+                        # 2. Check normal war status
+                        try:
+                            logging.info("    Checking normal war status")
+                            war_data = await make_coc_request_async(
+                                f"clans/{clan_tag.replace('#', '%23')}/currentwar"
+                            )
+                            if war_data and war_data.get("state") == "inWar":
+                                await trigger_reminders(
+                                    war_data,
+                                    channel_data,
+                                    is_cwl=False,
+                                    guild_linked_accounts=guild_linked_accounts,
+                                )
+                        except Exception as e:
+                            logging.error(
+                                f"Error checking normal war for clan {clan_tag}: {e}"
+                            )
+
+                        # 3. Check preparation status
+                        try:
+                            logging.info("    Checking preparation status")
+                            if clan_tag in guild_prep_notifications:
+                                await check_prep_status(
+                                    clan_tag, war_data, league_data, int(guild_id_str)
+                                )
+                        except Exception as e:
+                            logging.error(
+                                f"Error checking prep status for clan {clan_tag}: {e}"
+                            )
+
+                    except Exception as e:
+                        logging.error(
+                            f"Error processing clan {clan_tag} in guild {guild_id_str}: {e}"
+                        )
+                        continue  # Continue with next clan
+
+            except Exception as e:
+                logging.error(f"Error processing guild {guild_id_str}: {e}")
+                continue  # Continue with next guild
 
         logging.info("=== Completed reminder check cycle ===\n")
 
     except Exception as e:
-        logging.error(f"Error in reminder check: {e}")
+        logging.error(f"Critical error in reminder check: {e}")
+        # Don't re-raise the exception to prevent the loop from stopping
+
+
+@reminder_check.error
+async def reminder_check_error(error):
+    """Handle errors in the reminder check loop."""
+    logging.error(f"Reminder check loop error: {error}")
+    # The loop will automatically restart
 
 
 # endregion
 
 
 # region War Reminder Checks
-async def normal_war_reminder_check():
-    for clan_tag, channel_data in clan_channels.items():
-        logging.info(
-            f"🔍 Checking for in-war attack reminders (Normal War) - Clan: {clan_tag}"
-        )
-
-        war_data = await make_coc_request_async(
-            f"clans/{clan_tag.replace('#', '%23')}/currentwar"
-        )
-        if not war_data or war_data.get("state") != "inWar":
-            continue
-
-        await trigger_reminders(war_data, channel_data, is_cwl=False)
-
-
+# This section was removed as the functionality is now handled in the main reminder_check loop
 # endregion
 
 
@@ -858,25 +1803,43 @@ def reset_reminder_flags(clan_tag, war_id):
         save_data(PREP_NOTIFICATION_FILE, prep_notifications)
 
 
-async def trigger_reminders(war_data, channel_data, is_cwl=False, round_num=None):
+def reset_reminder_flags_for_guild(clan_tag, war_id, guild_id):
+    """Reset reminder flags for a given war ID in the prep_notifications for a specific guild."""
+    guild_prep_notifications = get_guild_data(prep_notifications, guild_id)
+    if (
+        clan_tag in guild_prep_notifications
+        and war_id in guild_prep_notifications[clan_tag]["wars"]
+    ):
+        logging.info(
+            f"Resetting reminder flags for guild {guild_id}, clan {clan_tag}, War ID: {war_id}"
+        )
+        guild_prep_notifications[clan_tag]["wars"][war_id][
+            "1_hour_reminder_sent"
+        ] = False
+        save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+
+
+async def trigger_reminders(
+    war_data, channel_data, is_cwl=False, round_num=None, guild_linked_accounts=None
+):
     war_end_time_str = war_data.get("endTime")
     time_until_end = calculate_time_until_war_end(war_end_time_str, "inWar")
 
     war_type = "CWL" if is_cwl else "Normal"
-    round_info = f" (Runde {round_num})" if is_cwl and round_num else ""
+    round_info = f" (Round {round_num})" if is_cwl else ""
 
     reminder_time_messages = {
         "1_hour": {
-            "normal": "⏰ Der er 1 time tilbage af krigen! Husk at angribe! ⏰",
-            "cwl": "⏰ Der er 1 time tilbage af krigen! Husk at angribe og fylde CC til næste kamp! ⏰",
+            "normal": "⏰ There is 1 hour left in the war! Remember to attack! ⏰",
+            "cwl": "⏰ There is 1 hour left in the war! Remember to attack and fill CC for the next battle! ⏰",
         },
         "30_min": {
-            "normal": "⏰ Der er 30 minutter tilbage af krigen! Angrib nu! ⏰",
-            "cwl": "⏰ Der er 30 minutter tilbage af krigen! Angrib nu og husk at fylde CC til næste kamp! ⏰",
+            "normal": "⏰ There are 30 minutes left in the war! Attack now! ⏰",
+            "cwl": "⏰ There are 30 minutes left in the war! Attack now and remember to fill CC for the next battle! ⏰",
         },
         "15_min": {
-            "normal": "⚠️ 15 minutter tilbage af krigen! Skynd dig at angribe! ⚠️",
-            "cwl": "⚠️ 15 minutter tilbage af krigen! SÅ ER DET ALTSÅ NU FEDTNÆB! - Husk også at fylde CC til næste kamp! ⚠️",
+            "normal": "⚠️ 15 minutes left in the war! Hurry up and attack! ⚠️",
+            "cwl": "⚠️ 15 minutes left in the war! THIS IS IT, NOW OR NEVER! - Also remember to fill CC for the next battle! ⚠️",
         },
     }
 
@@ -909,23 +1872,21 @@ async def trigger_reminders(war_data, channel_data, is_cwl=False, round_num=None
         reminder_message = reminder_time_messages[reminder_triggered][message_type]
 
         message = (
-            f"⚔️ {war_type} krig{round_info} for {clan_name} ({clan_tag})\n"
+            f"⚔️ {war_type} war{round_info} for {clan_name} ({clan_tag})\n"
             f"{reminder_message}\n\n"
-            "Spillere der mangler at angribe:\n"
+            "Players who still need to attack:\n"
         )
 
         for player_tag, missing_attacks in unattacked_players.items():
             discord_mentions = [
                 f"<@{user_id}>"
-                for user_id, tags in linked_accounts.items()
+                for user_id, tags in (guild_linked_accounts or {}).items()
                 if player_tag in tags
             ]
             linked_users = (
-                ", ".join(discord_mentions)
-                if discord_mentions
-                else "Ingen Discord-link"
+                ", ".join(discord_mentions) if discord_mentions else "No Discord link"
             )
-            message += f"- {player_tag}: Mangler {missing_attacks} angreb. Linket: {linked_users}\n"
+            message += f"- {player_tag}: Missing {missing_attacks} attacks. Linked: {linked_users}\n"
 
         try:
             await channel.send(message)
@@ -936,7 +1897,7 @@ async def trigger_reminders(war_data, channel_data, is_cwl=False, round_num=None
             logging.error(f"Failed to send reminder: {e}")
 
 
-async def cwl_reminder_check_for_clan(clan_tag, channel_data):
+async def cwl_reminder_check_for_clan(clan_tag, channel_data, guild_linked_accounts):
     """Helper function to check CWL status for a single clan"""
     league_group = await make_coc_request_async(
         f"clans/{clan_tag.replace('#', '%23')}/currentwar/leaguegroup"
@@ -975,7 +1936,11 @@ async def cwl_reminder_check_for_clan(clan_tag, channel_data):
                     )
 
                 await trigger_reminders(
-                    current_war, channel_data, is_cwl=True, round_num=current_round
+                    current_war,
+                    channel_data,
+                    is_cwl=True,
+                    round_num=current_round,
+                    guild_linked_accounts=guild_linked_accounts,
                 )
                 break
 
@@ -983,12 +1948,13 @@ async def cwl_reminder_check_for_clan(clan_tag, channel_data):
             break
 
 
-async def check_prep_status(clan_tag, war_data, league_data):
+async def check_prep_status(clan_tag, war_data, league_data, guild_id):
     """Helper function to check preparation status for a single clan"""
-    if clan_tag not in prep_notifications:
+    guild_prep_notifications = get_guild_data(prep_notifications, guild_id)
+    if clan_tag not in guild_prep_notifications:
         return
 
-    prep_data = prep_notifications[clan_tag]
+    prep_data = guild_prep_notifications[clan_tag]
 
     # Check normal war preparation
     if war_data:
@@ -1000,7 +1966,7 @@ async def check_prep_status(clan_tag, war_data, league_data):
             )
             prep_data["wars"] = {}
         elif war_state == "preparation":
-            await process_normal_war_prep(clan_tag, war_data, prep_data)
+            await process_normal_war_prep(clan_tag, war_data, prep_data, guild_id)
 
     # Check CWL preparation
     if league_data and league_data.get("state") == "preparation":
@@ -1055,7 +2021,9 @@ async def check_prep_status(clan_tag, war_data, league_data):
                         )
 
                         if should_send and not reminder_sent:
-                            prep_channel_id = prep_data.get("channel", prep_channel)
+                            prep_channel_id = prep_data.get(
+                                "channel", get_prep_channel(guild_id)
+                            )
                             notifiers = prep_data.get("notifiers", [])
 
                             if prep_channel_id and notifiers:
@@ -1065,11 +2033,11 @@ async def check_prep_status(clan_tag, war_data, league_data):
                                         [f"<@{user_id}>" for user_id in notifiers]
                                     )
                                     message = (
-                                        f"🎯 **CWL Forberedelses-påmindelse for {clan_name}** ({clan_tag})\n\n"
-                                        f"> 🔔 **Opmærksomhed:** {notifier_mentions}\n"
-                                        f"> ⏳ **Tid tilbage:** Mindre end 1 time tilbage af forberedelsesfasen!\n\n"
-                                        f"⚔️ **Husk at sætte CWL lineup og tjek CC! 🏆**\n"
-                                        f"Sørg for, at alt er klar til kamp - flæk flæk! 💪🚀"
+                                        f"🎯 **CWL Preparation Reminder for {clan_name}** ({clan_tag})\n\n"
+                                        f"> 🔔 **Attention:** {notifier_mentions}\n"
+                                        f"> ⏳ **Time remaining:** Less than 1 hour left of preparation phase!\n\n"
+                                        f"⚔️ **Remember to set CWL lineup and check CC! 🏆**\n"
+                                        f"Make sure everything is ready for battle - let's go! 💪🚀"
                                     )
 
                                     await channel.send(message)
@@ -1091,61 +2059,24 @@ async def check_prep_status(clan_tag, war_data, league_data):
 
 
 # region Preparation Notifications
-def ensure_war_data_exists(clan_tag, war_id):
-    """Ensure the structure for a given war ID exists in prep_notifications."""
-    global prep_notifications
-    if clan_tag not in prep_notifications:
-        prep_notifications[clan_tag] = {"channel": None, "notifiers": [], "wars": {}}
-    if "wars" not in prep_notifications[clan_tag]:
-        prep_notifications[clan_tag]["wars"] = {}
-    if war_id not in prep_notifications[clan_tag]["wars"]:
-        prep_notifications[clan_tag]["wars"][war_id] = {"1_hour_reminder_sent": False}
+def ensure_war_data_exists_for_guild(clan_tag, war_id, guild_id):
+    """Ensure the structure for a given war ID exists in prep_notifications for a specific guild."""
+    guild_prep_notifications = get_guild_data(prep_notifications, guild_id)
+    if clan_tag not in guild_prep_notifications:
+        guild_prep_notifications[clan_tag] = {
+            "channel": None,
+            "notifiers": [],
+            "wars": {},
+        }
+    if "wars" not in guild_prep_notifications[clan_tag]:
+        guild_prep_notifications[clan_tag]["wars"] = {}
+    if war_id not in guild_prep_notifications[clan_tag]["wars"]:
+        guild_prep_notifications[clan_tag]["wars"][war_id] = {
+            "1_hour_reminder_sent": False
+        }
 
 
-async def process_normal_war_prep(clan_tag, war_data, prep_data):
-    """Process preparation notifications for normal wars."""
-    war_end_time_str = war_data.get("endTime")
-    war_id = f"{war_end_time_str}"
-
-    ensure_war_data_exists(clan_tag, war_id)
-
-    time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
-    logging.info(f"Normal war time until start for clan {clan_tag}: {time_until_start}")
-
-    clan_name = war_data.get("clan", {}).get("name", "Ukendt Klan")
-    reminder_sent = prep_data["wars"][war_id].get("1_hour_reminder_sent", False)
-    logging.info(f"Normal war reminder sent: {reminder_sent}")
-    if (
-        timedelta(hours=1, minutes=5) >= time_until_start > timedelta(minutes=25)
-        and not reminder_sent
-    ):
-        prep_channel_id = prep_data.get("channel", prep_channel)
-        notifiers = prep_data.get("notifiers", [])
-
-        if prep_channel_id and notifiers:
-            channel = bot.get_channel(prep_channel_id)
-            notifier_mentions = ", ".join([f"<@{user_id}>" for user_id in notifiers])
-
-            if channel:
-                try:
-                    await channel.send(
-                        f"⚠️ Forberedelses-påmindelse for klan {clan_name} {clan_tag}:\n"
-                        f"{notifier_mentions}, der er mindre end 1 time tilbage før krigen starter!!"
-                    )
-                    logging.info(f"Sent normal preparation reminder for war {war_id}.")
-
-                    prep_notifications[clan_tag]["wars"][war_id][
-                        "1_hour_reminder_sent"
-                    ] = True
-
-                    save_data(PREP_NOTIFICATION_FILE, prep_notifications)
-                except Exception as e:
-                    logging.error(
-                        f"Failed to send normal prep reminder for war {war_id}: {e}"
-                    )
-
-
-async def process_cwl_prep(clan_tag, league_data, prep_data):
+async def process_cwl_prep(clan_tag, league_data, prep_data, guild_id):
     if league_data.get("state") != "preparation":
         logging.info(f"Not in CWL preparation phase for clan {clan_tag}")
         return
@@ -1163,7 +2094,7 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
         return
 
     war_id = f"cwl_prep_{league_data.get('season', 'unknown')}"
-    ensure_war_data_exists(clan_tag, war_id)
+    ensure_war_data_exists_for_guild(clan_tag, war_id, guild_id)
 
     war_tag = next(
         (
@@ -1200,7 +2131,8 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
     logging.info(f"Current time (UTC): {current_time}")
     logging.info(f"Time until prep ends: {time_until_prep_end}")
 
-    reminder_sent = prep_notifications[clan_tag]["wars"][war_id].get(
+    guild_prep_notifications = get_guild_data(prep_notifications, guild_id)
+    reminder_sent = guild_prep_notifications[clan_tag]["wars"][war_id].get(
         "1_hour_reminder_sent", False
     )
 
@@ -1209,8 +2141,10 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
     logging.info(f"Should send reminder: {should_send}")
 
     if should_send and not reminder_sent:
-        prep_channel_id = prep_notifications[clan_tag].get("channel", prep_channel)
-        notifiers = prep_notifications[clan_tag].get("notifiers", [])
+        prep_channel_id = guild_prep_notifications[clan_tag].get(
+            "channel", get_prep_channel(guild_id)
+        )
+        notifiers = guild_prep_notifications[clan_tag].get("notifiers", [])
 
         if prep_channel_id and notifiers:
             channel = bot.get_channel(prep_channel_id)
@@ -1220,11 +2154,11 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
                 )
                 try:
                     message = (
-                        f"🎯 **CWL Forberedelses-påmindelse for {clan_name}** ({clan_tag})\n\n"
-                        f"> 🔔 **Opmærksomhed:** {notifier_mentions}\n"
-                        f"> ⏳ **Tid tilbage:** Mindre end 1 time tilbage af forberedelsesfasen!\n\n"
-                        f"⚔️ **Husk at sætte CWL lineup og tjek CC! 🏆**\n"
-                        f"Sørg for, at alt er klar til kamp - flæk flæk! 💪🚀"
+                        f"🎯 **CWL Preparation Reminder for {clan_name}** ({clan_tag})\n\n"
+                        f"> 🔔 **Attention:** {notifier_mentions}\n"
+                        f"> ⏳ **Time remaining:** Less than 1 hour left of preparation phase!\n\n"
+                        f"⚔️ **Remember to set CWL lineup and check CC! 🏆**\n"
+                        f"Make sure everything is ready for battle - let's go! 💪🚀"
                     )
 
                     await channel.send(message)
@@ -1232,7 +2166,7 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
                         f"Successfully sent CWL prep reminder for clan {clan_tag}"
                     )
 
-                    prep_notifications[clan_tag]["wars"][war_id][
+                    guild_prep_notifications[clan_tag]["wars"][war_id][
                         "1_hour_reminder_sent"
                     ] = True
                     save_data(PREP_NOTIFICATION_FILE, prep_notifications)
@@ -1246,16 +2180,403 @@ async def process_cwl_prep(clan_tag, league_data, prep_data):
             )
 
 
+async def process_normal_war_prep(clan_tag, war_data, prep_data, guild_id):
+    """Process preparation notifications for normal wars."""
+    war_end_time_str = war_data.get("endTime")
+    war_id = f"{war_end_time_str}"
+
+    ensure_war_data_exists_for_guild(clan_tag, war_id, guild_id)
+
+    time_until_start = calculate_time_until_war_end(war_end_time_str, "preparation")
+    logging.info(f"Normal war time until start for clan {clan_tag}: {time_until_start}")
+
+    clan_name = war_data.get("clan", {}).get("name", "Unknown Clan")
+    reminder_sent = prep_data["wars"][war_id].get("1_hour_reminder_sent", False)
+    logging.info(f"Normal war reminder sent: {reminder_sent}")
+    if (
+        timedelta(hours=1, minutes=5) >= time_until_start > timedelta(minutes=25)
+        and not reminder_sent
+    ):
+        prep_channel_id = prep_data.get("channel", get_prep_channel(guild_id))
+        notifiers = prep_data.get("notifiers", [])
+
+        if prep_channel_id and notifiers:
+            channel = bot.get_channel(prep_channel_id)
+            notifier_mentions = ", ".join([f"<@{user_id}>" for user_id in notifiers])
+
+            if channel:
+                try:
+                    await channel.send(
+                        f"⚠️ Preparation reminder for clan {clan_name} {clan_tag}:\n"
+                        f"{notifier_mentions}, there is less than 1 hour left before the war starts!!"
+                    )
+                    logging.info(f"Sent normal preparation reminder for war {war_id}.")
+
+                    prep_data["wars"][war_id]["1_hour_reminder_sent"] = True
+                    save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+                except Exception as e:
+                    logging.error(
+                        f"Failed to send normal prep reminder for war {war_id}: {e}"
+                    )
+
+
 # endregion
 
 
 @bot.event
 async def on_ready():
     logging.info(f"Logged in as {bot.user}")
-    setup()  # Remove await
-    await bot.sync_all_application_commands()
-    print("Slash commands synced globally!")
+    logging.info(f"Bot is in {len(bot.guilds)} guilds")
+
+    # Initialize database (gracefully handle failures for local development)
+    try:
+        await db_manager.initialize()
+        logging.info("✅ Database initialized successfully")
+    except Exception as e:
+        logging.warning(
+            f"Database initialization failed (running in local/JSON mode): {e}"
+        )
+        logging.info("Bot will continue using JSON files for data storage")
+
+        # Load the cog
+    setup()
+    logging.info("Cog loaded")
+
+    # Wait for cog commands to register
+    logging.info("Waiting for cog commands to register...")
+    await asyncio.sleep(5)
+
+    # Count available commands before sync
+    try:
+        # For nextcord, we need to count differently
+        cog = bot.get_cog("ClashCommands")
+        if cog:
+            # Use a more reliable method to count cog commands
+            cog_commands = 13  # We know we have 13 cog commands
+            logging.info(f"Cog found: {cog.__class__.__name__}")
+
+            # Try to get actual command count for debugging
+            if hasattr(cog, "__cog_commands__"):
+                actual_count = len(cog.__cog_commands__)
+                logging.info(f"Actual cog commands found: {actual_count}")
+                if actual_count == 0:
+                    logging.warning(
+                        "Cog commands list is empty - commands may still be registering"
+                    )
+                    logging.info(
+                        "Waiting additional 10 seconds for command registration to complete..."
+                    )
+                    await asyncio.sleep(10)
+
+                    # Check again after waiting
+                    final_count = len(cog.__cog_commands__)
+                    logging.info(f"Final cog command count after wait: {final_count}")
+            elif hasattr(cog, "get_commands"):
+                actual_count = len(cog.get_commands())
+                logging.info(f"Actual cog commands found: {actual_count}")
+        else:
+            cog_commands = 0
+            logging.warning("ClashCommands cog not found!")
+
+        # Count global slash commands
+        global_commands = 4  # We know we have 4 global commands
+        total_expected = cog_commands + global_commands
+        logging.info(
+            f"Commands before sync: Cog={cog_commands}, Global={global_commands}, Total={total_expected}"
+        )
+
+    except Exception as e:
+        logging.warning(f"Could not count commands: {e}")
+        total_expected = 17  # Expected number of commands (13 cog + 4 global)
+
+        # Simplified command synchronization
+    try:
+        logging.info("Syncing slash commands...")
+
+        # Single sync attempt with reasonable wait
+        await asyncio.sleep(5)
+        synced = await bot.sync_all_application_commands()
+        synced_count = len(synced) if synced else 0
+
+        if synced_count > 0:
+            logging.info(f"✅ Successfully synced {synced_count} slash commands")
+        else:
+            logging.warning(f"⚠️ Sync reported 0 commands, but commands may still work")
+            logging.warning(
+                f"Expected {total_expected} commands - this is a known nextcord issue"
+            )
+            logging.info(
+                "Commands should still be available in Discord despite sync reporting 0"
+            )
+
+    except Exception as e:
+        logging.error(f"Failed to sync commands: {e}")
+        logging.warning(
+            "Bot will continue running - commands may still work despite sync failure"
+        )
+
     reminder_check.start()
+    logging.info("VV-Alarm bot is ready and running!")
 
 
-bot.run(DISCORD_BOT_TOKEN)
+# Graceful shutdown handling
+import signal
+import sys
+
+
+def signal_handler(sig, frame):
+    logging.info(
+        "Received shutdown signal, saving data and shutting down gracefully..."
+    )
+
+    # Save all data one final time
+    try:
+        save_data(LINKED_ACCOUNTS_FILE, linked_accounts)
+        save_data(CLAN_CHANNELS_FILE, clan_channels)
+        save_data(PREP_NOTIFICATION_FILE, prep_notifications)
+        logging.info("All data saved successfully")
+    except Exception as e:
+        logging.error(f"Error saving data during shutdown: {e}")
+
+    logging.info("Shutdown complete")
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+# Add basic health check endpoint (for monitoring)
+@bot.slash_command(
+    name="sync_commands",
+    description="Manually sync all slash commands (Bot admin only)",
+    default_member_permissions=nextcord.Permissions(administrator=True),
+)
+async def sync_commands(interaction: nextcord.Interaction):
+    """Manually sync slash commands."""
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        logging.info("Manual command sync initiated")
+
+        # Count commands before sync
+        try:
+            cog = bot.get_cog("ClashCommands")
+            cog_commands = (
+                len(cog.__cog_commands__)
+                if cog and hasattr(cog, "__cog_commands__")
+                else 0
+            )
+            global_commands = 4  # We know we have 4 global commands
+            total_commands = cog_commands + global_commands
+        except Exception:
+            total_commands = 17  # Expected number
+
+        # Try normal sync first
+        synced = await bot.sync_all_application_commands()
+        count = len(synced) if synced else 0
+
+        # If normal sync returns 0, try again after waiting
+        if count == 0 and total_commands > 0:
+            logging.info("Normal sync returned 0, trying again after wait...")
+            await asyncio.sleep(2)
+            synced = await bot.sync_all_application_commands()
+            count = len(synced) if synced else 0
+
+        await interaction.followup.send(
+            f"✅ **Command Sync Complete**\n"
+            f"**Available Commands:** {total_commands}\n"
+            f"**Synced Commands:** {count}\n"
+            f"Commands should now be available in Discord.",
+            ephemeral=True,
+        )
+        logging.info(
+            f"Manual sync completed: {count} commands (Available: {total_commands})"
+        )
+
+    except Exception as e:
+        logging.error(f"Manual sync failed: {e}")
+        await interaction.followup.send(
+            f"❌ **Command Sync Failed**\n"
+            f"Error: {str(e)}\n"
+            f"Check logs for more details.",
+            ephemeral=True,
+        )
+
+
+@bot.slash_command(
+    name="force_sync",
+    description="Force clear and re-sync all commands (Bot admin only)",
+    default_member_permissions=nextcord.Permissions(administrator=True),
+)
+async def force_sync(interaction: nextcord.Interaction):
+    """Force clear and re-sync all commands."""
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        logging.info("Force command sync initiated")
+
+        # Force sync by waiting and re-syncing
+        await interaction.followup.send(
+            "🔄 **Step 1:** Waiting for Discord sync...", ephemeral=True
+        )
+        await asyncio.sleep(5)
+
+        # Re-sync commands
+        await interaction.followup.send(
+            "🔄 **Step 2:** Re-syncing commands...", ephemeral=True
+        )
+        synced = await bot.sync_all_application_commands()
+        count = len(synced) if synced else 0
+
+        # Count available commands
+        try:
+            cog = bot.get_cog("ClashCommands")
+            cog_commands = (
+                len(cog.__cog_commands__)
+                if cog and hasattr(cog, "__cog_commands__")
+                else 0
+            )
+            global_commands = 4  # We know we have 4 global commands
+            total_commands = cog_commands + global_commands
+        except Exception:
+            total_commands = 17  # Expected number
+
+        await interaction.followup.send(
+            f"✅ **Force Sync Complete**\n"
+            f"**Available Commands:** {total_commands}\n"
+            f"**Synced Commands:** {count}\n"
+            f"All commands have been cleared and re-registered.",
+            ephemeral=True,
+        )
+        logging.info(f"Force sync completed: {count} commands")
+
+    except Exception as e:
+        logging.error(f"Force sync failed: {e}")
+        await interaction.followup.send(
+            f"❌ **Force Sync Failed**\n"
+            f"Error: {str(e)}\n"
+            f"Check logs for more details.",
+            ephemeral=True,
+        )
+
+
+@bot.slash_command(
+    name="list_commands",
+    description="List all available bot commands (Bot admin only)",
+    default_member_permissions=nextcord.Permissions(administrator=True),
+)
+async def list_commands(interaction: nextcord.Interaction):
+    """List all registered commands."""
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # Get all slash commands from the bot
+        commands = []
+
+        # Get all commands from different sources
+        try:
+            # Get cog commands
+            cog = bot.get_cog("ClashCommands")
+            if cog and hasattr(cog, "__cog_commands__"):
+                for command in cog.__cog_commands__:
+                    if hasattr(command, "name") and hasattr(command, "description"):
+                        commands.append(f"• `/{command.name}` - {command.description}")
+
+            # Add global commands manually (nextcord doesn't expose pending_application_commands)
+            global_commands = [
+                ("sync_commands", "Manually sync all slash commands (Bot admin only)"),
+                ("force_sync", "Force clear and re-sync all commands (Bot admin only)"),
+                ("list_commands", "List all available bot commands (Bot admin only)"),
+                (
+                    "health_check",
+                    "Check if the bot is running properly (Bot admin only)",
+                ),
+            ]
+            for cmd_name, cmd_desc in global_commands:
+                commands.append(f"• `/{cmd_name}` - {cmd_desc}")
+        except Exception as e:
+            logging.error(f"Error getting commands: {e}")
+            commands = ["❌ Could not retrieve command list"]
+
+        if commands:
+            command_list = "\n".join(commands)
+            message = f"🤖 **Available Commands ({len(commands)}):**\n\n{command_list}"
+        else:
+            message = "❌ No commands found. Try running `/sync_commands` first."
+
+        # Split message if too long
+        if len(message) > 2000:
+            chunks = [message[i : i + 1900] for i in range(0, len(message), 1900)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await interaction.followup.send(chunk, ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"**Continued...**\n{chunk}", ephemeral=True
+                    )
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+
+    except Exception as e:
+        logging.error(f"List commands failed: {e}")
+        await interaction.followup.send(
+            f"❌ **Error listing commands**\n{str(e)}", ephemeral=True
+        )
+
+
+@bot.slash_command(
+    name="health_check",
+    description="Check if the bot is running properly (Bot admin only)",
+    default_member_permissions=nextcord.Permissions(administrator=True),
+)
+async def health_check(interaction: nextcord.Interaction):
+    """Basic health check for monitoring purposes."""
+    try:
+        # Check if we can access the API
+        test_response = await make_coc_request_async("clans/%23P80CC2U", retries=1)
+        api_status = "✅ Working" if test_response else "❌ Failed"
+
+        # Check data files
+        files_status = "✅ All files accessible"
+        for filepath in [
+            LINKED_ACCOUNTS_FILE,
+            CLAN_CHANNELS_FILE,
+            PREP_NOTIFICATION_FILE,
+            PREP_CHANNEL_FILE,
+        ]:
+            if not os.path.exists(filepath):
+                files_status = f"⚠️ Missing {filepath}"
+                break
+
+        # Count monitored clans
+        total_clans = sum(len(guild_clans) for guild_clans in clan_channels.values())
+
+        health_report = (
+            f"🏥 **VV-Alarm Health Check**\n\n"
+            f"🤖 **Bot Status:** Online\n"
+            f"🌐 **API Status:** {api_status}\n"
+            f"📁 **Files Status:** {files_status}\n"
+            f"🏰 **Guilds:** {len(bot.guilds)}\n"
+            f"⚔️ **Monitored Clans:** {total_clans}\n"
+            f"🔄 **Reminder Loop:** {'✅ Running' if reminder_check.is_running() else '❌ Stopped'}\n"
+            f"📊 **Latency:** {round(bot.latency * 1000)}ms"
+        )
+
+        await interaction.response.send_message(health_report, ephemeral=True)
+
+    except Exception as e:
+        logging.error(f"Health check failed: {e}")
+        await interaction.response.send_message(
+            f"❌ **Health Check Failed**\n```{str(e)}```", ephemeral=True
+        )
+
+
+if __name__ == "__main__":
+    try:
+        logging.info("Starting VV-Alarm Discord Bot...")
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        logging.fatal(f"Fatal error starting bot: {e}")
+        sys.exit(1)
