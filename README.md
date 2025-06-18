@@ -1,4 +1,4 @@
-# VV-Alarm Discord Bot
+# AttackAlert Discord Bot
 
 A comprehensive Discord bot for Clash of Clans war monitoring and reminders. Supports multiple Discord servers with guild-specific data isolation, hybrid database/JSON storage, and advanced war tracking features.
 
