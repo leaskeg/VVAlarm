@@ -2188,12 +2188,30 @@ async def trigger_reminders(
         message_type = "cwl" if is_cwl else "normal"
         reminder_message = reminder_time_messages[reminder_triggered][message_type]
 
-        message = (
-            f"⚔️ {war_type} war{round_info} for {clan_name} ({clan_tag})\n"
-            f"{reminder_message}\n\n"
-            "Players who still need to attack:\n"
+        # Create beautiful embed for war reminders
+        color_map = {
+            "1_hour": 0x00FF00,  # Green
+            "30_min": 0xFFFF00,  # Yellow
+            "15_min": 0xFF0000,  # Red
+        }
+
+        embed = nextcord.Embed(
+            title=f"⚔️ {war_type} War Alert{round_info}",
+            description=f"**{clan_name}** `{clan_tag}`",
+            color=color_map.get(reminder_triggered, 0x00FF00),
+            timestamp=datetime.now(timezone.utc),
         )
 
+        # Add time remaining field
+        time_emoji = {"1_hour": "⏰", "30_min": "⚠️", "15_min": "🚨"}
+        embed.add_field(
+            name=f"{time_emoji.get(reminder_triggered, '⏰')} Reminder",
+            value=reminder_message,
+            inline=False,
+        )
+
+        # Add players who need to attack
+        unattacked_list = []
         for player_tag, missing_attacks in unattacked_players.items():
             discord_mentions = [
                 f"<@{user_id}>"
@@ -2201,12 +2219,51 @@ async def trigger_reminders(
                 if player_tag in tags
             ]
             linked_users = (
-                ", ".join(discord_mentions) if discord_mentions else "No Discord link"
+                ", ".join(discord_mentions)
+                if discord_mentions
+                else "❌ No Discord link"
             )
-            message += f"- {player_tag}: Missing {missing_attacks} attacks. Linked: {linked_users}\n"
+            unattacked_list.append(
+                f"• **{player_tag}**: {missing_attacks} attacks missing\n   └ {linked_users}"
+            )
+
+        if unattacked_list:
+            # Split into chunks if too long
+            unattacked_text = "\n".join(unattacked_list)
+            if len(unattacked_text) > 1024:
+                # Split into multiple fields if too long
+                chunks = []
+                current_chunk = ""
+                for line in unattacked_list:
+                    if len(current_chunk + line) > 1000:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = line + "\n"
+                    else:
+                        current_chunk += line + "\n"
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+
+                for i, chunk in enumerate(chunks):
+                    field_name = f"🎯 Players Needing Attacks ({i+1}/{len(chunks)})"
+                    embed.add_field(name=field_name, value=chunk, inline=False)
+            else:
+                embed.add_field(
+                    name="🎯 Players Needing Attacks",
+                    value=unattacked_text,
+                    inline=False,
+                )
+
+        embed.set_footer(text=f"AttackAlert • {war_type} War System")
 
         try:
-            await channel.send(message)
+            urgency_map = {
+                "1_hour": "⏰ **WAR REMINDER**",
+                "30_min": "⚠️ **URGENT WAR REMINDER**",
+                "15_min": "🚨 **FINAL WAR WARNING**",
+            }
+            content = urgency_map.get(reminder_triggered, "⚔️ **WAR ALERT**")
+
+            await channel.send(content=content, embed=embed)
             logging.info(
                 f"Sent {reminder_triggered} reminder for {war_type} war to {channel_data['channel']}"
             )
@@ -2391,15 +2448,41 @@ async def check_prep_status(clan_tag, war_data, league_data, guild_id):
                                         notifier_mentions = ", ".join(
                                             [f"<@{user_id}>" for user_id in notifiers]
                                         )
-                                        message = (
-                                            f"🎯 **CWL Preparation Reminder for {clan_name}** ({clan_tag})\n\n"
-                                            f"> 🔔 **Attention:** {notifier_mentions}\n"
-                                            f"> ⏳ **Time remaining:** Less than 1 hour left of preparation phase!\n\n"
-                                            f"⚔️ **Remember to set CWL lineup and check CC! 🏆**\n"
-                                            f"Make sure everything is ready for battle - let's go! 💪🚀"
+
+                                        # Create beautiful embed for CWL preparation reminder
+                                        embed = nextcord.Embed(
+                                            title="🎯 CWL Preparation Alert",
+                                            description=f"**{clan_name}** `{clan_tag}`",
+                                            color=0xFF6B35,  # Orange color for urgency
+                                            timestamp=datetime.now(timezone.utc),
                                         )
 
-                                        await channel.send(message)
+                                        embed.add_field(
+                                            name="⏰ Time Remaining",
+                                            value="**Less than 1 hour** left in preparation phase!",
+                                            inline=False,
+                                        )
+
+                                        embed.add_field(
+                                            name="🔔 Attention Required",
+                                            value=f"{notifier_mentions}",
+                                            inline=False,
+                                        )
+
+                                        embed.add_field(
+                                            name="✅ Action Items",
+                                            value="• Set your CWL lineup\n• Check clan castle troops\n• Prepare for battle!",
+                                            inline=False,
+                                        )
+
+                                        embed.set_footer(
+                                            text="AttackAlert • CWL Preparation System"
+                                        )
+
+                                        await channel.send(
+                                            content=f"🚨 **CWL PREPARATION ALERT** 🚨",
+                                            embed=embed,
+                                        )
                                         logging.info(
                                             f"Successfully sent CWL prep reminder for clan {clan_tag}"
                                         )
@@ -2555,15 +2638,37 @@ async def process_cwl_prep(clan_tag, league_data, prep_data, guild_id):
                     [f"<@{user_id}>" for user_id in notifiers]
                 )
                 try:
-                    message = (
-                        f"🎯 **CWL Preparation Reminder for {clan_name}** ({clan_tag})\n\n"
-                        f"> 🔔 **Attention:** {notifier_mentions}\n"
-                        f"> ⏳ **Time remaining:** Less than 1 hour left of preparation phase!\n\n"
-                        f"⚔️ **Remember to set CWL lineup and check CC! 🏆**\n"
-                        f"Make sure everything is ready for battle - let's go! 💪🚀"
+                    # Create beautiful embed for CWL preparation reminder
+                    embed = nextcord.Embed(
+                        title="🎯 CWL Preparation Alert",
+                        description=f"**{clan_name}** `{clan_tag}`",
+                        color=0xFF6B35,  # Orange color for urgency
+                        timestamp=datetime.now(timezone.utc),
                     )
 
-                    await channel.send(message)
+                    embed.add_field(
+                        name="⏰ Time Remaining",
+                        value="**Less than 1 hour** left in preparation phase!",
+                        inline=False,
+                    )
+
+                    embed.add_field(
+                        name="🔔 Attention Required",
+                        value=f"{notifier_mentions}",
+                        inline=False,
+                    )
+
+                    embed.add_field(
+                        name="✅ Action Items",
+                        value="• Set your CWL lineup\n• Check clan castle troops\n• Prepare for battle!",
+                        inline=False,
+                    )
+
+                    embed.set_footer(text="AttackAlert • CWL Preparation System")
+
+                    await channel.send(
+                        content=f"🚨 **CWL PREPARATION ALERT** 🚨", embed=embed
+                    )
                     logging.info(
                         f"Successfully sent CWL prep reminder for clan {clan_tag}"
                     )
@@ -2617,9 +2722,36 @@ async def process_normal_war_prep(clan_tag, war_data, prep_data, guild_id):
 
                 if channel:
                     try:
+                        # Create beautiful embed for normal war preparation reminder
+                        embed = nextcord.Embed(
+                            title="⚠️ War Preparation Alert",
+                            description=f"**{clan_name}** `{clan_tag}`",
+                            color=0xFFD700,  # Gold color for war prep
+                            timestamp=datetime.now(timezone.utc),
+                        )
+
+                        embed.add_field(
+                            name="⏰ Time Remaining",
+                            value="**Less than 1 hour** before war starts!",
+                            inline=False,
+                        )
+
+                        embed.add_field(
+                            name="🔔 Attention Required",
+                            value=f"{notifier_mentions}",
+                            inline=False,
+                        )
+
+                        embed.add_field(
+                            name="⚔️ Prepare for Battle",
+                            value="• Check your war base\n• Plan your attacks\n• Coordinate with clan mates",
+                            inline=False,
+                        )
+
+                        embed.set_footer(text="AttackAlert • War Preparation System")
+
                         await channel.send(
-                            f"⚠️ Preparation reminder for clan {clan_name} {clan_tag}:\n"
-                            f"{notifier_mentions}, there is less than 1 hour left before the war starts!!"
+                            content=f"⚔️ **WAR PREPARATION ALERT** ⚔️", embed=embed
                         )
                         logging.info(
                             f"Sent normal preparation reminder for war {war_id}."
